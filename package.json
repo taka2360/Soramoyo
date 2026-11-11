@@ -1,0 +1,21 @@
+{
+  "name": "soramoyo",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.74",
+    "typescript": "~5.9.3",
+    "vite": "^8.3.8",
+    "vitest": "^5.1.0"
+  },
+  "dependencies": {
+    "lil-gui": "^0.21.0"
+  }
+}
