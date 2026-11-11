@@ -77,11 +77,53 @@ fn baseOf(f: u32, k: i32) -> f32 {
   return 0.0;
 }
 
-fn scalarTendency(f: u32, i: i32, j: i32, k: i32) -> f32 {
+// ---- 正値保存リミッタ（RK3 の最終段のみ。Skamarock 2006 の考え方）
+// 各面のフラックスは「質量を減らす側のセル」の係数 r で縮める。
+// r = min(1, そのセルにある量 / そのセルから出ていく量)。面ごとに両側で同じフラックスを使うので保存的。
+fn pdRatio(f: u32, i: i32, j: i32, k: i32) -> f32 { return diag[dPd(f, idx(i, j, k))]; }
+fn limX(f: u32, i: i32, j: i32, k: i32) -> f32 {
+  let F = sFluxX(f, i, j, k);
+  return F * select(pdRatio(f, i, j, k), pdRatio(f, i - 1, j, k), F > 0.0);
+}
+fn limY(f: u32, i: i32, j: i32, k: i32) -> f32 {
+  let F = sFluxY(f, i, j, k);
+  return F * select(pdRatio(f, i, j, k), pdRatio(f, i, j - 1, k), F > 0.0);
+}
+fn limZ(f: u32, i: i32, j: i32, k: i32) -> f32 {
+  if (k <= 0 || k >= i32(P.nz)) { return 0.0; }
+  let F = sFluxZ(f, i, j, k);
+  return F * select(pdRatio(f, i, j, k), pdRatio(f, i, j, k - 1), F > 0.0);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn csPdRatio(@builtin(global_invocation_id) g: vec3u) {
+  if (g.x >= P.nx || g.y >= P.ny || g.z >= P.nz) { return; }
+  let i = i32(g.x); let j = i32(g.y); let k = i32(g.z);
+  let id = idx(i, j, k);
   let cl = col[k];
-  var t = -(sFluxX(f, i + 1, j, k) - sFluxX(f, i, j, k)) / P.dx
-          -(sFluxY(f, i, j + 1, k) - sFluxY(f, i, j, k)) / P.dy
-          -(sFluxZ(f, i, j, k + 1) - sFluxZ(f, i, j, k)) / (cl.rho0 * cl.dzc);
+  for (var f = F_QV; f <= F_QR; f++) {
+    let out = (max(sFluxX(f, i + 1, j, k), 0.0) - min(sFluxX(f, i, j, k), 0.0)) / P.dx
+            + (max(sFluxY(f, i, j + 1, k), 0.0) - min(sFluxY(f, i, j, k), 0.0)) / P.dy
+            + (max(sFluxZ(f, i, j, k + 1), 0.0) - min(sFluxZ(f, i, j, k), 0.0)) / (cl.rho0 * cl.dzc);
+    var r = 1.0;
+    let avail = max(sN[f * P.n + id], 0.0);
+    if (out * P.dt > avail) { r = avail / (out * P.dt); }
+    diag[dPd(f, id)] = r;
+  }
+}
+
+fn scalarTendency(f: u32, i: i32, j: i32, k: i32, limited: bool) -> f32 {
+  let cl = col[k];
+  var t: f32;
+  if (limited) {
+    t = -(limX(f, i + 1, j, k) - limX(f, i, j, k)) / P.dx
+        -(limY(f, i, j + 1, k) - limY(f, i, j, k)) / P.dy
+        -(limZ(f, i, j, k + 1) - limZ(f, i, j, k)) / (cl.rho0 * cl.dzc);
+  } else {
+    t = -(sFluxX(f, i + 1, j, k) - sFluxX(f, i, j, k)) / P.dx
+        -(sFluxY(f, i, j + 1, k) - sFluxY(f, i, j, k)) / P.dy
+        -(sFluxZ(f, i, j, k + 1) - sFluxZ(f, i, j, k)) / (cl.rho0 * cl.dzc);
+  }
 
   // 拡散（基本場からの偏差に対して。K = ν/Pr）
   let s0 = c(f, i, j, k) - baseOf(f, k);
@@ -114,11 +156,12 @@ fn csScalars(@builtin(global_invocation_id) g: vec3u) {
   if (g.x >= P.nx || g.y >= P.ny || g.z >= P.nz) { return; }
   let i = i32(g.x); let j = i32(g.y); let k = i32(g.z);
   let id = idx(i, j, k);
-  sO[F_TH * P.n + id] = sN[F_TH * P.n + id] + P.dt * scalarTendency(F_TH, i, j, k);
+  sO[F_TH * P.n + id] = sN[F_TH * P.n + id] + P.dt * scalarTendency(F_TH, i, j, k, false);
   if ((P.flags & FLAG_MOIST) != 0u) {
-    sO[F_QV * P.n + id] = sN[F_QV * P.n + id] + P.dt * scalarTendency(F_QV, i, j, k);
-    sO[F_QC * P.n + id] = sN[F_QC * P.n + id] + P.dt * scalarTendency(F_QC, i, j, k);
-    sO[F_QR * P.n + id] = sN[F_QR * P.n + id] + P.dt * scalarTendency(F_QR, i, j, k);
+    let lim = P.stage == 2u && (P.flags & FLAG_PD) != 0u;
+    sO[F_QV * P.n + id] = sN[F_QV * P.n + id] + P.dt * scalarTendency(F_QV, i, j, k, lim);
+    sO[F_QC * P.n + id] = sN[F_QC * P.n + id] + P.dt * scalarTendency(F_QC, i, j, k, lim);
+    sO[F_QR * P.n + id] = sN[F_QR * P.n + id] + P.dt * scalarTendency(F_QR, i, j, k, lim);
   } else {
     sO[F_QV * P.n + id] = sN[F_QV * P.n + id];
     sO[F_QC * P.n + id] = 0.0;
@@ -224,6 +267,11 @@ fn csMomentum(@builtin(global_invocation_id) g: vec3u) {
             -(uFluxZ(i, j, k + 1) - uFluxZ(i, j, k)) * rdz;
     t += momDiff(F_U, i, j, k, 0.5 * (nuAt(i - 1, j, k) + nuAt(i, j, k)));
     t -= sp * (c(F_U, i, j, k) - cl.u0);
+    if (P.ny > 1u && P.fcor != 0.0) {
+      // コリオリ力と大規模気圧傾度（地衡風）。地面に対する風で評価
+      let vAt = 0.25 * (c(F_V, i - 1, j, k) + c(F_V, i, j, k) + c(F_V, i - 1, j + 1, k) + c(F_V, i, j + 1, k));
+      t += P.fcor * (vAt + P.frameV - cl.vg);
+    }
     sO[F_U * P.n + id] = sN[F_U * P.n + id] + P.dt * t;
   }
   // v（y 面 j-1/2）
@@ -233,6 +281,10 @@ fn csMomentum(@builtin(global_invocation_id) g: vec3u) {
             -(vFluxZ(i, j, k + 1) - vFluxZ(i, j, k)) * rdz;
     t += momDiff(F_V, i, j, k, 0.5 * (nuAt(i, j - 1, k) + nuAt(i, j, k)));
     t -= sp * (c(F_V, i, j, k) - cl.v0);
+    if (P.fcor != 0.0) {
+      let uAt = 0.25 * (c(F_U, i, j - 1, k) + c(F_U, i + 1, j - 1, k) + c(F_U, i, j, k) + c(F_U, i + 1, j, k));
+      t -= P.fcor * (uAt + P.frameU - cl.ug);
+    }
     sO[F_V * P.n + id] = sN[F_V * P.n + id] + P.dt * t;
   } else {
     sO[F_V * P.n + id] = sN[F_V * P.n + id];

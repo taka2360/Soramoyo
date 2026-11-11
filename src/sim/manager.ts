@@ -1,10 +1,24 @@
 import { CloudModel } from './model';
-import { type SimCase, armCumulus, weismanKlemp, caseMeanWind } from './cases';
+import { type SimCase, weismanKlemp, bomex, landDay } from './cases';
 
-export const SCENARIOS: Record<string, () => SimCase> = {
-  '晴天積雲（地表加熱, 128², 100m）': () => armCumulus({ nx: 128, dx: 100, dzMin: 40, shf: 120, lhf: 400 }),
-  '晴天積雲（地表加熱, 256², 100m）': () => armCumulus({ nx: 256, dx: 100, dzMin: 40, shf: 120, lhf: 400 }),
-  '積乱雲（暖気泡, 128², 500m）': () => weismanKlemp({ nx: 128, dx: 500, dzMin: 250, shear: 10, qv0: 0.014 }),
+export const SCENARIOS: Record<string, (latDeg: number) => SimCase> = {
+  '夏の晴れた日・陸上（128², 100m）': (lat) => landDay({
+    name: '夏の晴れた日（陸上）', description: '米国中部の夏の朝のサウンディング（ARM SGP）。日射で地面が温まり、昼前から積雲が湧く。',
+    sounding: 'arm', nx: 128, dx: 100, dzMin: 40, ztop: 6000, soilWet: 0.35, windMs: 8, latDeg: lat,
+  }),
+  '夏の晴れた日・陸上（256², 100m）': (lat) => landDay({
+    name: '夏の晴れた日（陸上・高解像度）', description: '同上、領域 25.6 km。',
+    sounding: 'arm', nx: 256, dx: 100, dzMin: 40, ztop: 6000, soilWet: 0.35, windMs: 8, latDeg: lat,
+  }),
+  '乾いた高気圧の日（128², 100m）': (lat) => landDay({
+    name: '乾いた高気圧の日', description: '同じ気温で水蒸気が 6 割。混合層は育つが雲はほとんどできない。',
+    sounding: 'armDry', nx: 128, dx: 100, dzMin: 40, ztop: 6000, soilWet: 0.2, windMs: 5, latDeg: lat,
+  }),
+  '蒸し暑く不安定な日（256², 250m）': (lat) => landDay({
+    name: '蒸し暑く不安定な日', description: '条件付き不安定（Weisman–Klemp 型）。午後に積乱雲が立つことがある。',
+    sounding: 'wk', nx: 256, dx: 250, dzMin: 80, ztop: 16000, soilWet: 0.5, windMs: 4, latDeg: lat,
+  }),
+  '貿易風の海（BOMEX, 128², 100m）': () => bomex({ nx: 128, dx: 100, dz: 40 }),
   '積乱雲（暖気泡, 256², 250m）': () => weismanKlemp({ nx: 256, dx: 250, dzMin: 150, shear: 10, qv0: 0.014 }),
 };
 
@@ -29,15 +43,52 @@ export class SimManager {
 
   constructor(private device: GPUDevice) {}
 
-  load(name = this.scenario): void {
+  /** シミュレーション開始時刻（UTC ms）。時計 = startUtc + model.time */
+  startUtc = 0;
+
+  /** 追いつき（時刻ジャンプや早送り）の目標時刻（UTC ms）。null なら通常 */
+  catchUpTarget: number | null = null;
+  /** 追いつき中の1フレームあたりのステップ数 */
+  catchUpSteps = 12;
+  /** 雲粒数濃度（地表日射の計算用） */
+  nDrop = 3e8;
+
+  /**
+   * シナリオを読み込み、targetUtc の時刻の空になるよう準備する。
+   * 日変化のシナリオは、その日の夜明け（現地 startHour）から計算を始めて targetUtc まで追いつく。
+   */
+  loadFor(name: string, latDeg: number, targetUtc: number, utcOffsetHours: number): void {
+    const sc = SCENARIOS[name](latDeg);
+    let start = targetUtc;
+    if (sc.diurnal) {
+      const localMs = targetUtc + utcOffsetHours * 3600_000;
+      const midnightLocal = Math.floor(localMs / 86400_000) * 86400_000;
+      start = midnightLocal + sc.diurnal.startHour * 3600_000 - utcOffsetHours * 3600_000;
+      if (start > targetUtc) start -= 86400_000;
+    }
+    this.loadCase(name, sc, start);
+    this.catchUpTarget = targetUtc > start + 1000 ? targetUtc : null;
+  }
+
+  load(name: string, latDeg: number, startUtc: number): void {
+    this.loadCase(name, SCENARIOS[name](latDeg), startUtc);
+  }
+
+  private loadCase(name: string, sc: SimCase, startUtc: number): void {
     this.scenario = name;
     this.model?.destroy();
-    this.simCase = SCENARIOS[name]();
+    this.simCase = sc;
     this.model = new CloudModel(this.device, this.simCase.config, this.simCase.initial);
     const g = this.simCase.config.grid;
     this.origin = [-g.nx * g.dx / 2, -g.ny * g.dy / 2];
-    this.wind = caseMeanWind(this.simCase.name);
+    this.wind = this.simCase.config.frame ?? [0, 0];
     this.debt = 0;
+    this.startUtc = startUtc;
+  }
+
+  /** 現在のシミュレーション時刻（UTC ms） */
+  get simUtc(): number {
+    return this.startUtc + (this.model?.time ?? 0) * 1000;
   }
 
   unload(): void {
@@ -54,6 +105,17 @@ export class SimManager {
     const m = this.model;
     if (!m || !this.running || this.busy) {
       return wantSec;
+    }
+    m.nDrop = this.nDrop;
+    if (this.catchUpTarget !== null) {
+      // 追いつき中：時計に関係なく多めに進める
+      let adv = 0;
+      for (let n = 0; n < this.catchUpSteps && this.simUtc < this.catchUpTarget; n++) adv += m.step(1);
+      if (this.simUtc >= this.catchUpTarget) this.catchUpTarget = null;
+      this.moveOrigin(adv);
+      this.debt = 0;
+      this.effectiveSpeed = this.effectiveSpeed * 0.9 + (dtReal > 0 ? adv / dtReal : 0) * 0.1;
+      return adv;
     }
     this.debt = Math.min(this.debt + wantSec, Math.max(m.dt * this.maxStepsPerFrame * 2, 1));
     let adv = 0;
@@ -75,22 +137,13 @@ export class SimManager {
     this.origin[1] += this.wind[1] * sec;
   }
 
-  /** 描画せずに早回しする（雲が育つまで待つ用）。進めた秒数を返す */
-  async spinUp(seconds: number, onProgress: (f: number) => void): Promise<number> {
-    const m = this.model;
-    if (!m) return 0;
-    this.busy = '早回し中';
-    let done = 0;
-    try {
-      while (done < seconds && this.model === m) {
-        done += m.step(10);
-        await this.device.queue.onSubmittedWorkDone();
-        onProgress(done / seconds);
-      }
-    } finally {
-      this.busy = '';
+  /** 時計が新しい時刻に飛んだときの処理。近い未来なら追いつき、そうでなければ計算し直す */
+  jumpTo(targetUtc: number, latDeg: number, utcOffsetHours: number): void {
+    const now = this.simUtc;
+    if (targetUtc > now && targetUtc - now < 18 * 3600_000) {
+      this.catchUpTarget = targetUtc;
+    } else {
+      this.loadFor(this.scenario, latDeg, targetUtc, utcOffsetHours);
     }
-    this.moveOrigin(done);
-    return done;
   }
 }

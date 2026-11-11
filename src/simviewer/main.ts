@@ -4,7 +4,7 @@
 import GUI from 'lil-gui';
 import { initGpu, showFatal } from '../core/gpu';
 import { CloudModel, F } from '../sim/model';
-import { type SimCase, straka, bryanFritsch, weismanKlemp, armCumulus } from '../sim/cases';
+import { type SimCase, straka, bryanFritsch, weismanKlemp, armCumulus, bomex } from '../sim/cases';
 import vizWgsl from '../shaders/sim/viz.wgsl?raw';
 
 const CASES: Record<string, () => SimCase> = {
@@ -13,6 +13,8 @@ const CASES: Record<string, () => SimCase> = {
   'Bryan–Fritsch 湿潤気泡 (2D, dx=100m)': () => bryanFritsch(100),
   'Weisman–Klemp 積乱雲 (3D, 128², dx=500m)': () => weismanKlemp({ nx: 128, dx: 500, dzMin: 250, shear: 10, qv0: 0.014 }),
   'Weisman–Klemp 積乱雲 (3D, 256², dx=250m)': () => weismanKlemp({ nx: 256, dx: 250, dzMin: 150, shear: 10, qv0: 0.014 }),
+  'BOMEX 貿易風積雲 (3D, 64², dx=100m)': () => bomex({ nx: 64, dx: 100, dz: 40 }),
+  'BOMEX 貿易風積雲 (3D, 128², dx=100m)': () => bomex({ nx: 128, dx: 100, dz: 40 }),
   '晴天積雲 ARM SGP (3D, 128², dx=100m)': () => armCumulus({ nx: 128, dx: 100, dzMin: 40, shf: 120, lhf: 400 }),
   '晴天積雲 ARM SGP (3D, 256², dx=100m)': () => armCumulus({ nx: 256, dx: 100, dzMin: 40, shf: 120, lhf: 400 }),
 };
@@ -197,9 +199,11 @@ async function main() {
           `θ' 最小 ${fmt(st.minThp, 2)} / 最大 ${fmt(st.maxThp, 2)} K\n` +
           (simCase.config.moist
             ? `qc 最大 ${fmt(st.maxQc * 1000, 2)} g/kg  qr 最大 ${fmt(st.maxQr * 1000, 2)} g/kg   雲底 ${fmt(st.cloudBase === null ? null : st.cloudBase / 1000, 2)} km  雲頂 ${fmt(st.cloudTop === null ? null : st.cloudTop / 1000, 2)} km  最大雲量 ${(st.cloudCover * 100).toFixed(1)}%\n` +
-              `水の収支：全水量の変化 ${(model.waterDrift * 100).toExponential(2)} %   地表降水 ${(st.precip / 1e6).toFixed(3)} kt   負値切り詰め ${(st.clipped / 1e6).toExponential(2)} kt\n`
+              `水の収支：全水量の変化 ${(model.waterDrift * 100).toExponential(2)} %${simCase.config.forcing ? '（大規模強制で水が出入りするため保存量ではない）' : ''}   地表降水 ${(st.precip / 1e6).toFixed(3)} kt   負値切り詰め ${(st.clipped / 1e6).toExponential(2)} kt\n`
             : '') +
-          `液水温位の平均 ${st.meanThl.toFixed(5)} K\n`
+          `液水温位の平均 ${st.meanThl.toFixed(5)} K   LWP ${st.lwp.toFixed(1)} g/m²   最大の層雲量 ${(st.cloudCover * 100).toFixed(1)}%\n` +
+          `地表：Ts ${(st.surface.ts - 273.15).toFixed(1)}℃  顕熱 ${st.surface.h.toFixed(0)} W/m²  潜熱 ${st.surface.le.toFixed(0)} W/m²  日射 ${st.surface.sw.toFixed(0)} W/m²\n` +
+          (simCase.reference ? `${simCase.reference}\n` : '')
         : '') +
       (frontX !== null ? `前線位置 ${(frontX / 1000).toFixed(2)} km（標準解 900秒で ≈15.5km）\n` : '');
 

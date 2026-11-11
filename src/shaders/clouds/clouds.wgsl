@@ -77,16 +77,18 @@ fn sampleMedium(p: vec3f, h: f32, withShadow: bool) -> Medium {
   let uvw = vec3f(lx / C.size.x, ly / C.size.y, zToW(zmap, h, C.ztop, C.nz));
   let v = textureSampleLevel(vol, smpRep, uvw, 0.0);
   var lwc = v.r; // g/m³
-  // ---- 細部合成（試作）：格子より細かい縁の凹凸。強さは渦粘性（乱流の強さ）で変える
+  // ---- 細部合成（試作）：格子より細かい縁の凹凸。
+  // 雲水量に比例して削る（固定量で削ると、薄い雲がノイズの形だけ残って繊維状に見えるため）。
+  // 縁（雲水量の少ない所）ほど強く、渦粘性（乱流の強さ）が大きいほど強く削る。
   if (C.detail > 0.0 && lwc > 0.0) {
     let q = vec3f(lx, ly, h) / C.noisePeriod + vec3f(0.0, 0.0, C.time * 0.0005);
     let n = textureSampleLevel(noiseTex, smpRep, q, 0.0);
     let n2 = textureSampleLevel(noiseTex, smpRep, q * 3.7, 0.0);
     let turb = clamp(v.b / 20.0, 0.0, 1.0);
-    let shape = n.r * 0.6 + n.g * 0.4;
-    let fine = n2.g * 0.5 + n2.b * 0.5;
-    let erosion = C.detail * (0.15 + 0.25 * turb) * (1.0 - mix(shape, fine, 0.4));
-    lwc = max(lwc - erosion, 0.0) * (1.0 + 0.3 * C.detail * (shape - 0.5));
+    let shape = mix(n.r * 0.6 + n.g * 0.4, n2.g * 0.5 + n2.b * 0.5, 0.35);
+    let edge = 1.0 - clamp(lwc / 0.6, 0.0, 1.0);
+    let cut = C.detail * (0.5 + 0.5 * turb) * edge * (1.0 - shape);
+    lwc *= clamp(1.0 - 1.6 * cut, 0.0, 1.0);
   }
   m.sigma = sigmaCloud(lwc * 1e-3, C.nDrop) + sigmaRain(v.g * 1e-3);
   if (withShadow && m.sigma > 0.0) {
@@ -95,13 +97,55 @@ fn sampleMedium(p: vec3f, h: f32, withShadow: bool) -> Medium {
   return m;
 }
 
+// ---------------------------------------------------------------- 薄明光線
+// 雲の影に入った空気は太陽光を散乱しない。視線上で「影のせいで欠けた単散乱光」を見積もって差し引く。
+// （空の輝度 LUT は雲の無い大気の値なので、その差分として扱う。多重散乱の欠けは無視）
+fn shaftDeficit(o: vec3f, d: vec3f, tEnd: f32, sun: vec3f, jitter: f32) -> vec3f {
+  if (sun.z <= 0.01) { return vec3f(0.0); }
+  let tmax = min(tEnd, 40000.0);
+  if (tmax <= 0.0) { return vec3f(0.0); }
+  let camR = A.bottom_radius + o.z / 1000.0;
+  let nu = dot(d, sun);
+  let pr = rayleighPhase(nu);
+  let pm = miePhase(A.mie_g, nu);
+  var acc = vec3f(0.0);
+  let N = 24;
+  var tPrev = 0.0;
+  for (var i = 0; i < N; i++) {
+    let x = (f32(i) + jitter) / f32(N);
+    let t = tmax * x * x; // 近くを細かく
+    let dt = t - tPrev;
+    tPrev = t;
+    let p = o + d * t;
+    let h = altitude(p);
+    if (h > C.slabTop) { continue; }
+    var q = p;
+    if (h < C.slabBot) { q = p + sun * ((C.slabBot + 1.0 - h) / sun.z); }
+    let hq = altitude(q);
+    let od = textureSampleLevel(shadowVol, smpRep, domainUvw(q, hq), 0.0).r;
+    let shadowFrac = 1.0 - exp(-od);
+    if (shadowFrac <= 0.001) { continue; }
+    let rKm = A.bottom_radius + h / 1000.0;
+    let up = normalize(p - vec3f(0.0, 0.0, -EARTH_R_M));
+    let sunE = F.sunIllum * getTransmittanceToSun(rKm, dot(up, sun));
+    let hk = h / 1000.0;
+    let scat = A.rayleigh_scattering * exp(-hk / 8.0) * pr + A.mie_scattering * exp(-hk / A.mie_scale_height) * pm; // [1/km]
+    let tv = getTransmittance(camR, d.z, t / 1000.0, rayIntersectsGround(camR, d.z));
+    acc += tv * sunE * scat * (dt / 1000.0) * shadowFrac;
+  }
+  // 数値の破綻（NaN/Inf）が露出計算に波及しないように
+  if (any(acc != acc) || any(acc > vec3f(1e9))) { return vec3f(0.0); }
+  return acc;
+}
+
 fn ignNoise(p: vec2f) -> f32 {
   return fract(52.9829189 * fract(dot(p, vec2f(0.06711056, 0.00583715))));
 }
 
 @fragment
 fn fsMain(in: VsOut) -> @location(0) vec4f {
-  let cur = march(in);
+  var cur = march(in);
+  if (any(cur != cur)) { cur = vec4f(0.0, 0.0, 0.0, 1.0); }
   // 時間方向の蓄積（簡易 TAA。カメラが動いたフレームは histAlpha=1 で履歴を捨てる）
   let prev = textureLoad(history, vec2i(in.pos.xy), 0);
   return mix(prev, cur, C.histAlpha);
@@ -189,12 +233,16 @@ fn march(in: VsOut) -> vec4f {
     t += ds;
   }
 
-  if (wsum <= 0.0) { return vec4f(0.0, 0.0, 0.0, 1.0); }
+  let pre = 1.0 / max(expo[0], 1e-4);
+  var tShaft = 40000.0;
+  if (sg.x > 0.0) { tShaft = sg.x; }
+  if (wsum > 0.0) { tShaft = depthW / wsum; }
+  let deficit = shaftDeficit(o, d, tShaft, sun, jitter);
+  if (wsum <= 0.0) { return vec4f(-deficit * pre, 1.0); }
   // 空気遠近：雲の平均的な距離までの大気の散乱と透過
   let dist = depthW / wsum;
   let pKm = camKm + d * (dist / 1000.0);
   let ap = getSkyRadianceToPoint(camKm, pKm, sun);
-  let col = ap.radiance * (1.0 - T) + ap.transmittance * L;
-  let pre = 1.0 / max(expo[0], 1e-4);
+  let col = ap.radiance * (1.0 - T) + ap.transmittance * L - deficit;
   return vec4f(col * pre, T);
 }

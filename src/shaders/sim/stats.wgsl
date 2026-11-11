@@ -2,7 +2,7 @@
 // stats[k*16 + m]：
 //  0 Σθ  1 Σqv  2 Σqc  3 Σqr  4 max|u|  5 max|v|  6 max w  7 min w
 //  8 max qc  9 max qr  10 雲セル数(qc>1e-5)  11 Σθl（液水温位）  12 min θ'  13 max θ'
-// 層 k = nz のワークグループは地表面（diag）の集計：0 Σ降水  1 Σ切り詰め水量
+// 層 k = nz のワークグループは地表面（diag）の集計：0 Σ降水  1 Σ切り詰め水量  2 ΣTs  3 ΣH  4 ΣLE  5 Σ日射
 
 const NSTAT: u32 = 16u;
 var<workgroup> red: array<array<f32, 14>, 256>;
@@ -13,7 +13,7 @@ fn csStats(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid:
   let plane = P.nx * P.ny;
   var a: array<f32, 14>;
   for (var m = 0u; m < 14u; m++) { a[m] = 0.0; }
-  a[7] = 1e9; a[12] = 1e9; a[13] = -1e9;
+  if (k < P.nz) { a[7] = 1e9; a[12] = 1e9; a[13] = -1e9; }
 
   if (k < P.nz) {
     let cl = col[k];
@@ -35,8 +35,12 @@ fn csStats(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid:
     }
   } else {
     for (var p = li; p < plane; p += 256u) {
-      a[0] += diag[D_PRECIP * P.n + p];
-      a[1] += diag[D_PRECIP * P.n + plane + p];
+      a[0] += diag[dSurf(0u, p)];
+      a[1] += diag[dSurf(1u, p)];
+      a[2] += diag[dSurf(2u, p)];
+      a[3] += diag[dSurf(3u, p)];
+      a[4] += diag[dSurf(4u, p)];
+      a[5] += diag[dSurf(5u, p)];
     }
   }
   red[li] = a;
@@ -46,7 +50,8 @@ fn csStats(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid:
       var x = red[li];
       let y = red[li + s];
       for (var m = 0u; m < 14u; m++) {
-        if (m == 4u || m == 5u || m == 6u || m == 8u || m == 9u || m == 13u) { x[m] = max(x[m], y[m]); }
+        if (k == P.nz) { x[m] += y[m]; }
+        else if (m == 4u || m == 5u || m == 6u || m == 8u || m == 9u || m == 13u) { x[m] = max(x[m], y[m]); }
         else if (m == 7u || m == 12u) { x[m] = min(x[m], y[m]); }
         else { x[m] += y[m]; }
       }

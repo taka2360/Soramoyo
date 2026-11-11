@@ -108,7 +108,8 @@ fn fsMain(in: VsOut) -> @location(0) vec4f {
   // 雲を合成（雲テクスチャは半解像度。双線形で拡大）
   let cuv = in.pos.xy / F.resolution;
   let cl = textureSampleLevel(cloudTex, smp, cuv, 0.0);
-  var outc = toHdr(L) * cl.a + cl.rgb;
+  var outc = max(toHdr(L) * cl.a + cl.rgb, vec3f(0.0)); // rgb は薄明光線の分だけ負になりうる
+  if (any(outc != outc)) { outc = vec3f(0.0); }
   let m = max(outc.r, max(outc.g, outc.b));
   outc = select(outc, outc * (60000.0 / m), m > 60000.0);
   return vec4f(outc, 1.0);

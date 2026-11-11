@@ -9,6 +9,7 @@ import { DEFAULT_ATMOSPHERE } from './atmosphere/spectrum';
 import { computeEphemeris } from './astro/scene';
 import { CloudVolume, type CloudSettings } from './render/clouds';
 import { SimManager, SCENARIOS } from './sim/manager';
+import { SkewT } from './ui/skewt';
 
 async function main(): Promise<void> {
   const canvas = document.getElementById('sky') as HTMLCanvasElement;
@@ -21,7 +22,7 @@ async function main(): Promise<void> {
   cam.attach(canvas);
 
   const rs: RenderSettings = { exposureEV: 0, autoExposure: true, grid: false, renderScale: 1, cloudScale: 0.5, whiteBalance: true };
-  const cs: CloudSettings = { dropletsPerCc: 300, detail: 1, maxDistKm: 120 };
+  const cs: CloudSettings = { dropletsPerCc: 300, detail: 0.6, maxDistKm: 120 };
   const atmoSettings = { ...DEFAULT_ATMOSPHERE };
   const lutOpt: PrecomputeOptions = { wavelengthGroups: 8, scatteringOrders: 6 };
 
@@ -29,7 +30,7 @@ async function main(): Promise<void> {
   const cloudVol = new CloudVolume(gpu.device);
   const renderer = new Renderer(gpu, canvas, atmo, cloudVol);
   const sim = new SimManager(gpu.device);
-  sim.load();
+  sim.loadFor(sim.scenario, obs.latDeg, clock.utcMs, obs.utcOffsetHours);
   cloudVol.attach(sim.model);
   const labels = new CompassLabels(document.getElementById('labels')!);
 
@@ -58,12 +59,8 @@ async function main(): Promise<void> {
   const simUi = {
     scenario: sim.scenario,
     enabled: true,
-    spinUp: async () => {
-      const adv = await sim.spinUp(5400, (f) => (simStatus = `早回し中 ${(f * 100).toFixed(0)}%`));
-      clock.utcMs += adv * 1000;
-      simStatus = '';
-    },
-    reset: () => { sim.load(simUi.scenario); cloudVol.attach(sim.model); },
+    ahead: () => { sim.catchUpTarget = sim.simUtc + 2 * 3600_000; },
+    reset: () => { sim.loadFor(simUi.scenario, obs.latDeg, clock.utcMs, obs.utcOffsetHours); cloudVol.attach(sim.model); },
   };
   const fs = panel.gui.addFolder('雲シミュレーション');
   fs.add(simUi, 'scenario', Object.keys(SCENARIOS)).name('大気の状態').onChange(() => simUi.reset());
@@ -72,11 +69,15 @@ async function main(): Promise<void> {
   });
   fs.add(sim, 'running').name('計算を進める');
   fs.add(sim, 'maxStepsPerFrame', 1, 20, 1).name('1フレームの最大ステップ');
-  fs.add(simUi, 'spinUp').name('90分 早回し（雲が育つまで）');
+  fs.add(sim, 'catchUpSteps', 1, 60, 1).name('追いつき時のステップ数');
+  fs.add(simUi, 'ahead').name('2時間先へ早送り');
   fs.add(simUi, 'reset').name('初期状態に戻す');
   fs.add(cs, 'dropletsPerCc', 30, 1500, 10).name('雲粒の数 [個/cm³]');
   fs.add(cs, 'detail', 0, 2, 0.05).name('細部合成の強さ');
   fs.add(cs, 'maxDistKm', 10, 200, 5).name('雲を描く距離 [km]');
+  const skewT = new SkewT(document.body);
+  const skewUi = { show: false };
+  fs.add(skewUi, 'show').name('Skew-T 図を表示').onChange((v: boolean) => skewT.setVisible(v));
 
   // 開発・検証用（コンソールから時刻や視線を操作する）
   (window as unknown as { __sora: unknown }).__sora = { clock, obs, cam, rs, cs, atmoSettings, lutOpt, recompute, renderer, sim, cloudVol, simUi };
@@ -85,19 +86,43 @@ async function main(): Promise<void> {
   let fps = 60;
   let uiTick = 0;
   let lastCamKey = '';
+  let lastClockSet = clock.utcMs;
+  let pendingJump: { target: number; at: number } | null = null;
   const frame = (now: number) => {
     const dtReal = Math.min(0.1, (now - last) / 1000);
     last = now;
     fps = fps * 0.95 + (1 / Math.max(dtReal, 1e-4)) * 0.05;
 
     // 時計と雲シミュレーション：計算が追いつく範囲で時計を進める
-    if (sim.model && sim.running && !sim.busy) {
+    // ユーザーが時計を動かしたら、操作が落ち着いてから（0.4秒）追いつき or 計算し直し
+    if (sim.model && Math.abs(clock.utcMs - lastClockSet) > 1000) {
+      pendingJump = { target: clock.utcMs, at: now };
+      lastClockSet = clock.utcMs;
+    }
+    if (pendingJump && sim.model) {
+      if (now - pendingJump.at > 400) {
+        if (Math.abs(pendingJump.target - sim.simUtc) > 120_000) {
+          sim.jumpTo(pendingJump.target, obs.latDeg, obs.utcOffsetHours);
+          cloudVol.attach(sim.model);
+          renderer.resetAdaptation();
+        }
+        pendingJump = null;
+      }
+    } else if (sim.model && sim.running && !sim.busy) {
+      // 地表の日射条件（太陽高度は計算の時刻で）
+      const sunNow = computeEphemeris(2440587.5 + sim.simUtc / 86400_000, obs, obs.elevationM);
+      const cz = sunNow.sunDir[2];
+      sim.model.env.cosZen = cz;
+      sim.model.env.swClear = cz > 0 ? 1098 * cz * Math.exp(-0.057 / cz) : 0; // Haurwitz の晴天日射
+      sim.nDrop = cs.dropletsPerCc * 1e6;
       const want = dtReal * clock.effectiveSpeed;
-      const adv = sim.frame(want, dtReal);
-      clock.utcMs += adv * 1000;
-    } else if (!sim.busy) {
+      sim.frame(want, dtReal);
+      clock.utcMs = sim.simUtc;
+      lastClockSet = clock.utcMs;
+    } else if (!sim.model) {
       clock.advance(dtReal);
     }
+    simStatus = sim.catchUpTarget !== null ? `追いつき中（あと ${((sim.catchUpTarget - sim.simUtc) / 3600_000).toFixed(1)} 時間）` : '';
 
     const eph = computeEphemeris(clock.julianDayUT, obs, obs.elevationM + cam.heightM);
     // カメラが動いたら雲の時間蓄積をやり直す（再投影はまだ無いため）
@@ -117,6 +142,7 @@ async function main(): Promise<void> {
 
     if (++uiTick % 10 === 0) {
       panel.refresh();
+      skewT.draw(sim.model);
       const [w, h] = renderer.size;
       const gpuMs = [...renderer.timer.ms].map(([k, v]) => `${k} ${v.toFixed(2)}`).join('  ');
       const deg = 180 / Math.PI;
@@ -130,9 +156,12 @@ async function main(): Promise<void> {
         `${w}×${h}  ${fps.toFixed(0)} fps` +
         (renderer.timer.enabled ? `  GPU[ms] ${gpuMs}` : '  (GPU 計測なし)') +
         (sim.model
-          ? `\n雲: ${sim.simCase!.name}  計算時刻 ${(sim.model.time / 60).toFixed(1)} 分  dt ${sim.model.dt.toFixed(2)} s  実効 ×${sim.effectiveSpeed.toFixed(0)}` +
+          ? `\n雲: ${sim.simCase!.name}  経過 ${(sim.model.time / 3600).toFixed(2)} 時間  dt ${sim.model.dt.toFixed(2)} s  実効 ×${sim.effectiveSpeed.toFixed(0)}` +
             (sim.model.lastStats
-              ? `  雲底 ${((sim.model.lastStats.cloudBase ?? NaN) / 1000).toFixed(2)} km  雲頂 ${((sim.model.lastStats.cloudTop ?? NaN) / 1000).toFixed(2)} km  w最大 ${sim.model.lastStats.maxW.toFixed(1)} m/s`
+              ? `\n雲底 ${((sim.model.lastStats.cloudBase ?? NaN) / 1000).toFixed(2)} km  雲頂 ${((sim.model.lastStats.cloudTop ?? NaN) / 1000).toFixed(2)} km  w最大 ${sim.model.lastStats.maxW.toFixed(1)} m/s  LWP ${sim.model.lastStats.lwp.toFixed(1)} g/m²` +
+                (sim.simCase!.config.surfaceEnergy
+                  ? `  地表 ${(sim.model.lastStats.surface.ts - 273.15).toFixed(1)}℃  日射 ${sim.model.lastStats.surface.sw.toFixed(0)}  顕熱 ${sim.model.lastStats.surface.h.toFixed(0)}  潜熱 ${sim.model.lastStats.surface.le.toFixed(0)} W/m²`
+                  : '')
               : '') +
             (simStatus ? `  ${simStatus}` : '')
           : '') +

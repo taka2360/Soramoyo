@@ -4,7 +4,7 @@ import fftWgsl from '../shaders/sim/fft.wgsl?raw';
 import tridiagWgsl from '../shaders/sim/tridiag.wgsl?raw';
 import microWgsl from '../shaders/sim/micro.wgsl?raw';
 import statsWgsl from '../shaders/sim/stats.wgsl?raw';
-import { type Grid, type BaseState, packColumn } from './grid';
+import { type Grid, type BaseState, type LargeScaleForcing, packColumn, COL_STRIDE } from './grid';
 import { LV, CP } from './thermo';
 
 export const NFIELDS = 7;
@@ -26,9 +26,23 @@ export interface ModelConfig {
   /** スポンジ層の下端 [m] と最大減衰率 [1/s] */
   spongeZ: number;
   spongeRate: number;
-  /** 地表の顕熱・潜熱フラックス [W/m²]（一定。段階5で日射と結合） */
+  /** 固定の地表顕熱・潜熱フラックス [W/m²]（surfaceEnergy=false のとき） */
   shf: number;
   lhf: number;
+  /** 大規模強制（沈降・放射・地衡風・ナッジング） */
+  forcing?: LargeScaleForcing;
+  /** コリオリ係数 f [1/s] */
+  fcor?: number;
+  /** 計算座標系の移動速度（地面に対する）[m/s] */
+  frame?: [number, number];
+  /** 地表摩擦：固定 u* [m/s]（0 ならバルク式）、粗度 z0 [m]（0 なら摩擦なし） */
+  ustar?: number;
+  z0?: number;
+  /** 地表エネルギー収支（日射→地温→顕熱・潜熱）を使う */
+  surfaceEnergy?: boolean;
+  surface?: { albedo: number; soilWet: number; tDeep: number; cSoil: number };
+  /** 水物質の正値保存リミッタ */
+  positiveDefinite?: boolean;
   /** 時間刻みの上限 [s] と目標 CFL 数 */
   dtMax: number;
   cfl: number;
@@ -40,6 +54,8 @@ export interface LevelStats {
   maxQc: number; maxQr: number; cloudCells: number; sumThl: number;
   minThp: number; maxThp: number;
 }
+
+export interface SurfaceStats { ts: number; h: number; le: number; sw: number }
 
 export interface ModelStats {
   levels: LevelStats[];
@@ -53,6 +69,10 @@ export interface ModelStats {
   cloudBase: number | null; cloudTop: number | null; cloudCover: number;
   /** 液水温位の質量加重平均 [K] */
   meanThl: number;
+  /** 雲水量の柱積算の領域平均 [g/m²] */
+  lwp: number;
+  /** 雲量（どこかの高さに雲がある柱の割合…の代わりに、最大の層雲量） */
+  surface: SurfaceStats;
   time: number;
 }
 
@@ -85,6 +105,8 @@ export class CloudModel {
   private pipes = new Map<string, GPUComputePipeline>();
   private bindCache = new Map<string, GPUBindGroup>();
   private initialWater = 0;
+  private evapAccum = 0;
+  private lastStatTime = 0;
 
   constructor(private device: GPUDevice, cfg: ModelConfig, initial: Float32Array<ArrayBuffer>) {
     this.cfg = cfg;
@@ -99,10 +121,16 @@ export class CloudModel {
     const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
     this.states = [0, 1, 2].map((i) => device.createBuffer({ label: `state${i}`, size: n * NFIELDS * 4, usage: S }));
     device.queue.writeBuffer(this.states[0], 0, initial);
-    this.colBuf = device.createBuffer({ label: 'column', size: g.nz * 16 * 4, usage: S });
-    device.queue.writeBuffer(this.colBuf, 0, packColumn(g, cfg.base));
+    this.colBuf = device.createBuffer({ label: 'column', size: g.nz * COL_STRIDE * 4, usage: S });
+    device.queue.writeBuffer(this.colBuf, 0, packColumn(g, cfg.base, cfg.forcing));
     this.cplx = device.createBuffer({ label: 'cplx', size: n * 8, usage: S });
-    this.diag = device.createBuffer({ label: 'diag', size: (2 * n + 2 * g.nx * g.ny) * 4, usage: S });
+    const plane = g.nx * g.ny;
+    this.diag = device.createBuffer({ label: 'diag', size: (5 * n + 8 * plane) * 4, usage: S });
+    // 地表面温度の初期値 = 最下層の気温
+    const ts0 = new Float32Array(plane).fill(cfg.base.th0[0] * cfg.base.pi0[0]);
+    device.queue.writeBuffer(this.diag, (n + 2 * plane) * 4, ts0);
+    // 正値保存リミッタの係数の初期値（使わないときも 1 にしておく）
+    device.queue.writeBuffer(this.diag, 2 * n * 4, new Float32Array(3 * n).fill(1));
     this.statsBuf = device.createBuffer({ label: 'stats', size: (g.nz + 1) * NSTAT * 4, usage: S });
     this.statsRead = device.createBuffer({ size: (g.nz + 1) * NSTAT * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     this.paramBuf = device.createBuffer({ size: PARAM_SLOT * 3, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -112,7 +140,7 @@ export class CloudModel {
     this.layout = device.createBindGroupLayout({
       label: 'sim',
       entries: [
-        { binding: 0, visibility: C, buffer: { type: 'uniform', hasDynamicOffset: true, minBindingSize: 80 } },
+        { binding: 0, visibility: C, buffer: { type: 'uniform', hasDynamicOffset: true, minBindingSize: 144 } },
         { binding: 1, visibility: C, buffer: st('read-only-storage') },
         { binding: 2, visibility: C, buffer: st('read-only-storage') },
         { binding: 3, visibility: C, buffer: st('read-only-storage') },
@@ -127,7 +155,7 @@ export class CloudModel {
       this.pipes.set(label, device.createComputePipeline({ label, layout: pl, compute: { module: device.createShaderModule({ label, code }), entryPoint } }));
 
     const dyn = commonWgsl + dynamicsWgsl;
-    for (const ep of ['csNu', 'csScalars', 'csMomentum', 'csDivergence', 'csProject']) mk(ep, dyn, ep);
+    for (const ep of ['csNu', 'csPdRatio', 'csScalars', 'csMomentum', 'csDivergence', 'csProject']) mk(ep, dyn, ep);
     const fft = (N: number, dir: number, axis: number) =>
       commonWgsl +
       fftWgsl
@@ -155,7 +183,7 @@ export class CloudModel {
       bg = this.device.createBindGroup({
         layout: this.layout,
         entries: [
-          { binding: 0, resource: { buffer: this.paramBuf, size: 80 } },
+          { binding: 0, resource: { buffer: this.paramBuf, size: 144 } },
           { binding: 1, resource: { buffer: this.colBuf } },
           { binding: 2, resource: { buffer: this.states[nI] } },
           { binding: 3, resource: { buffer: this.states[cI] } },
@@ -181,19 +209,30 @@ export class CloudModel {
     return this.diag;
   }
 
+  /** 雲粒数濃度 [1/m³]（地表日射の雲の光学的厚さに使う。描画と同じ値） */
+  nDrop = 3e8;
+  /** 日射の条件（毎フレーム、天文計算から与える） */
+  env = { cosZen: 0, swClear: 0 };
+
   private writeParams(dt: number): void {
     const g = this.cfg.grid;
     const c = this.cfg;
-    const flags = (c.moist ? 1 : 0) | (c.smagorinsky ? 2 : 0) | (c.rain ? 4 : 0);
+    const flags = (c.moist ? 1 : 0) | (c.smagorinsky ? 2 : 0) | (c.rain ? 4 : 0) |
+      (c.surfaceEnergy ? 8 : 0) | (c.positiveDefinite !== false ? 16 : 0);
+    const sf = c.surface ?? { albedo: 0.2, soilWet: 0.3, tDeep: 295, cSoil: 2e5 };
+    const fr = c.frame ?? [0, 0];
     const buf = new ArrayBuffer(PARAM_SLOT * 3);
     [dt / 3, dt / 2, dt].forEach((dts, s) => {
-      const u = new Uint32Array(buf, s * PARAM_SLOT, 20);
-      const f = new Float32Array(buf, s * PARAM_SLOT, 20);
+      const u = new Uint32Array(buf, s * PARAM_SLOT, 36);
+      const f = new Float32Array(buf, s * PARAM_SLOT, 36);
       u[0] = g.nx; u[1] = g.ny; u[2] = g.nz; u[3] = this.n;
       f[4] = g.dx; f[5] = g.dy; f[6] = dts; f[7] = dt;
       u[8] = s; u[9] = flags; f[10] = c.nuConst; f[11] = c.cs;
       f[12] = c.spongeZ; f[13] = c.spongeRate; f[14] = g.ztop; f[15] = c.prandtl;
-      f[16] = c.shf; f[17] = c.lhf;
+      f[16] = c.shf; f[17] = c.lhf; f[18] = c.fcor ?? 0; f[19] = c.ustar ?? 0;
+      f[20] = fr[0]; f[21] = fr[1]; f[22] = this.env.cosZen; f[23] = this.env.swClear;
+      f[24] = sf.albedo; f[25] = sf.soilWet; f[26] = c.z0 ?? 0; f[27] = this.nDrop;
+      f[28] = sf.tDeep; f[29] = 86400; f[30] = sf.cSoil; f[31] = 0;
     });
     this.device.queue.writeBuffer(this.paramBuf, 0, buf);
   }
@@ -235,6 +274,7 @@ export class CloudModel {
       perms.forEach(([nI, cI, oI], stage) => {
         const bg = this.bind(nI, cI, oI);
         if (stage === 0) run('csNu', bg, stage, ...g3);
+        if (stage === 2 && this.cfg.moist && this.cfg.positiveDefinite !== false) run('csPdRatio', bg, stage, ...g3);
         run('csScalars', bg, stage, ...g3);
         run('csMomentum', bg, stage, ...g3);
         run('csDivergence', bg, stage, ...g3);
@@ -301,13 +341,19 @@ export class CloudModel {
       const so = g.nz * NSTAT;
       const precip = a[so] * cellArea;
       const clipped = a[so + 1] * cellArea;
-      // 地表からの蒸発で入った水（一定フラックス）を差し引いて収支を見る
-      const evap = (this.cfg.lhf / LV) * area * time;
+      const np = g.nx * g.ny;
+      const surface: SurfaceStats = { ts: a[so + 2] / np, h: a[so + 3] / np, le: a[so + 4] / np, sw: a[so + 5] / np };
+      let lwp = 0;
+      for (let k = 0; k < g.nz; k++) lwp += (levels[k].sumQc / np) * base.rho0[k] * g.dzc[k];
+      // 地表からの蒸発で入った水を差し引いて収支を見る（エネルギー収支モードでは積算値）
+      this.evapAccum += (this.cfg.surfaceEnergy ? surface.le : this.cfg.lhf) / LV * area * (time - this.lastStatTime);
+      this.lastStatTime = time;
+      const evap = this.evapAccum;
       const total = airWater + precip - clipped - evap;
       if (Number.isNaN(this.initialWater)) this.initialWater = total;
       this.lastStats = {
         levels, totalWater: total, airWater, precip, clipped, ...agg,
-        cloudBase, cloudTop, cloudCover: cover, meanThl: thlMass / mass, time,
+        cloudBase, cloudTop, cloudCover: cover, meanThl: thlMass / mass, lwp: lwp * 1000, surface, time,
       };
     });
   }

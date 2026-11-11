@@ -14,9 +14,17 @@ const F_QC: u32 = 5u;
 const F_QR: u32 = 6u;
 const NFIELDS: u32 = 7u;
 
-// diag バッファ
-const D_NU: u32 = 0u;     // 渦粘性 [m²/s]（セル中心）
-const D_PRECIP: u32 = 1u; // 地表の積算降水量 [kg/m² = mm]（k=0 面のみ使用）
+// diag バッファ（n = 全セル数, plane = nx*ny）
+//   [0, n)              渦粘性 [m²/s]
+//   [n, n+plane)        地表の積算降水量 [kg/m²]
+//   [n+plane, +plane)   負値の切り詰めで増えた水量の累計 [kg/m²]
+//   [n+2plane, +plane)  地表面温度 Ts [K]
+//   [n+3plane, +plane)  地表の顕熱フラックス H [W/m²]
+//   [n+4plane, +plane)  地表の潜熱フラックス LE [W/m²]
+//   [n+5plane, +plane)  地表の日射 [W/m²]
+//   [2n, 5n)            正値保存リミッタの係数（qv, qc, qr）
+const D_NU: u32 = 0u;
+const D_PRECIP: u32 = 1u;
 
 const GRAV: f32 = 9.81;
 const CP: f32 = 1004.5;
@@ -27,20 +35,27 @@ const EPSV: f32 = 0.62198;
 const FLAG_MOIST: u32 = 1u;
 const FLAG_SMAG: u32 = 2u;
 const FLAG_RAIN: u32 = 4u;
+const FLAG_SURF_ENERGY: u32 = 8u; // 地表エネルギー収支で顕熱・潜熱を求める（0 なら固定フラックス）
+const FLAG_PD: u32 = 16u;         // 水物質の正値保存リミッタ
 
 struct Params {
   nx: u32, ny: u32, nz: u32, n: u32,
   dx: f32, dy: f32, dt: f32, dtFull: f32,   // dt = この RK 段の刻み、dtFull = 1ステップの刻み
   stage: u32, flags: u32, nuConst: f32, cs: f32,
   spongeZ: f32, spongeRate: f32, ztop: f32, prandtl: f32,
-  shf: f32, lhf: f32, pad0: f32, pad1: f32,   // 地表の顕熱・潜熱フラックス [W/m²]
+  shf: f32, lhf: f32, fcor: f32, ustar: f32,          // 固定の地表フラックス [W/m²]、コリオリ係数 [1/s]、固定 u*（0 ならバルク式）
+  frameU: f32, frameV: f32, cosZen: f32, swClear: f32,  // 計算座標系の移動速度 [m/s]、太陽天頂角の余弦、晴天時の地表日射 [W/m²]
+  albedo: f32, soilWet: f32, z0: f32, nDrop: f32,       // 地表アルベド、土壌の湿り（蒸発効率 β）、粗度 [m]、雲粒数濃度 [1/m³]
+  tDeep: f32, tauSoil: f32, cSoil: f32, pad0: f32,      // 深層の地温 [K]、復元時間 [s]、地表層の熱容量 [J/m²/K]
 };
 
 struct Col {
   zc: f32, zf: f32, dzc: f32, dzw: f32,
   rho0: f32, rhoF: f32, th0: f32, qv0: f32,
   pi0: f32, p0: f32, u0: f32, v0: f32,
-  pad0: f32, pad1: f32, pad2: f32, pad3: f32,
+  ug: f32, vg: f32, wsub: f32, thLs: f32,       // 地衡風、大規模沈降 [m/s]、θ の大規模・放射強制 [K/s]
+  qvLs: f32, nudge: f32, pad0: f32, pad1: f32,  // qv の大規模強制 [1/s]、基本場へのナッジング率 [1/s]
+  pad2: f32, pad3: f32, pad4: f32, pad5: f32,
 };
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -96,3 +111,7 @@ fn spongeCoef(z: f32) -> f32 {
   let s = sin(0.5 * 3.14159265 * (z - P.spongeZ) / (P.ztop - P.spongeZ));
   return P.spongeRate * s * s;
 }
+
+fn plane() -> u32 { return P.nx * P.ny; }
+fn dSurf(slot: u32, colId: u32) -> u32 { return P.n + slot * plane() + colId; } // slot: 0 降水 1 切り詰め 2 Ts 3 H 4 LE 5 SW
+fn dPd(f: u32, id: u32) -> u32 { return 2u * P.n + (f - F_QV) * P.n + id; }

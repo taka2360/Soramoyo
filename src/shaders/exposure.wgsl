@@ -20,7 +20,8 @@ fn csMain(@builtin(local_invocation_id) lid: vec3u, @builtin(local_invocation_in
       let c = textureLoad(hdrTex, vec2i(uv * dims), 0).rgb / (F.whitePoint * pre);
       // 画面中央をやや重視（中央重点測光）
       let w = 1.0 - 0.5 * length(uv - 0.5);
-      s += log(max(luminance(c), 1e-6)) * w;
+      let lum = luminance(c);
+      if (lum == lum && lum < 1e30) { s += log(max(lum, 1e-6)) * w; } // NaN/Inf は無視
       wsum += w;
     }
   }
@@ -40,7 +41,7 @@ fn csMain(@builtin(local_invocation_id) lid: vec3u, @builtin(local_invocation_in
       let tau = select(3.0, 0.6, tgt > lp);
       cur = mix(lp, tgt, 1.0 - exp(-F.dtReal / tau));
     }
-    expo[0] = exp(cur);
+    if (cur == cur) { expo[0] = exp(cur); } else { expo[0] = 1000.0; }
     expo[1] = pre;  // トーンマップがこのフレームの HDR を絶対輝度に戻すのに使う
   }
 }

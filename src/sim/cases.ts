@@ -1,10 +1,14 @@
-import { type Grid, type Sounding, buildBaseState, makeGrid, uniformLevels, stretchedLevels } from './grid';
+import { type Grid, type Sounding, type LargeScaleForcing, buildBaseState, makeGrid, uniformLevels, stretchedLevels } from './grid';
 import { type ModelConfig, NFIELDS, F } from './model';
 import { CP, G, LV, qvsat, saturationAdjust, exner, P00, KAPPA } from './thermo';
 
 export interface SimCase {
   name: string;
   description: string;
+  /** 日射と結合した日変化のケースか（開始時刻を現地 startHour に合わせる） */
+  diurnal?: { startHour: number };
+  /** 検証用の参照値（表示用） */
+  reference?: string;
   /** 推奨する計算時間 [s] */
   duration: number;
   config: ModelConfig;
@@ -217,7 +221,7 @@ export function weismanKlemp(opts: { nx: number; dx: number; dzMin: number; shea
     duration: 7200,
     config: {
       grid, base, moist: true, rain: true, smagorinsky: true, nuConst: 0, cs: 0.18, prandtl: 1 / 3, shf: 0, lhf: 0,
-      spongeZ: 15000, spongeRate: 1 / 300, dtMax: 6, cfl: 0.8,
+      spongeZ: 15000, spongeRate: 1 / 300, dtMax: 6, cfl: 0.8, frame: [us / 2, 0],
     },
     initial: a,
   };
@@ -265,14 +269,146 @@ export function armCumulus(opts: { nx: number; dx: number; dzMin: number; shf: n
     config: {
       grid, base, moist: true, rain: true, smagorinsky: true, nuConst: 0, cs: 0.18, prandtl: 1 / 3,
       shf: opts.shf, lhf: opts.lhf, spongeZ: 4500, spongeRate: 1 / 300, dtMax: 3, cfl: 0.7,
+      frame: [10, 0], z0: 0.1,
     },
     initial: a,
   };
 }
 
-/** 平均風（移動座標系の速度）[m/s]。ケースごとに描画側で領域を動かすのに使う */
-export function caseMeanWind(name: string): [number, number] {
-  if (name.startsWith('陸上の晴天積雲')) return [10, 0];
-  if (name.startsWith('Weisman')) return [5, 0];
-  return [0, 0];
+// ---------------------------------------------------------------------------
+function profile(zs: number[], vs: number[]) {
+  return (z: number) => {
+    if (z <= zs[0]) return vs[0];
+    for (let i = 1; i < zs.length; i++) {
+      if (z <= zs[i]) return vs[i - 1] + ((vs[i] - vs[i - 1]) * (z - zs[i - 1])) / (zs[i] - zs[i - 1]);
+    }
+    const n = zs.length - 1;
+    return vs[n] + ((vs[n] - vs[n - 1]) * (z - zs[n])) / (zs[n] - zs[n - 1]);
+  };
+}
+
+function perturb(g: Grid, a: Float32Array, zMax: number, thAmp: number, qAmp: number, seed: number) {
+  const n = g.nx * g.ny * g.nz;
+  const plane = g.nx * g.ny;
+  const r = rng(seed);
+  for (let k = 0; k < g.nz; k++) {
+    if (g.zc[k] > zMax) break;
+    for (let p = 0; p < plane; p++) {
+      a[F.TH * n + p + plane * k] += (r() - 0.5) * 2 * thAmp;
+      a[F.QV * n + p + plane * k] += (r() - 0.5) * 2 * qAmp;
+    }
+  }
+}
+
+/**
+ * BOMEX（Siebesma et al. 2003）：貿易風帯の海上の浅い積雲。標準的な LES 相互比較ケース。
+ * 地表フラックス固定、大規模沈降・放射冷却・乾燥移流・地衡風で準定常状態になる。
+ * 参照値（3〜6時間の平均、LES 群の範囲）：雲底 ≈ 500 m、雲頂 ≈ 1.5〜1.8 km、
+ * 層ごとの雲量の最大 ≈ 5〜8%、雲水量の柱積算（LWP）≈ 5〜12 g/m²。
+ */
+export function bomex(opts: { nx: number; dx: number; dz: number }): SimCase {
+  const zf = uniformLevels(Math.round(3000 / opts.dz), opts.dz);
+  const grid = makeGrid({ nx: opts.nx, ny: opts.nx, dx: opts.dx, dy: opts.dx, zf });
+  const thl = profile([0, 520, 1480, 2000, 3000], [298.7, 298.7, 302.4, 308.2, 311.85]);
+  const qt = profile([0, 520, 1480, 2000, 3000], [17.0e-3, 16.3e-3, 10.7e-3, 4.2e-3, 3.0e-3]);
+  const uG = (z: number) => (z <= 700 ? -8.75 : -8.75 + 1.8e-3 * (z - 700));
+  const frame: [number, number] = [-8, 0];
+  const snd: Sounding = { surfacePressure: 101500, theta: thl, qv: qt, u: (z) => uG(z) - frame[0], v: () => 0 };
+  const forcing: LargeScaleForcing = {
+    ug: (z) => -10 + 1.8e-3 * z,
+    vg: () => 0,
+    wsub: (z) => (z <= 1500 ? (-0.0065 * z) / 1500 : z <= 2100 ? -0.0065 + (0.0065 * (z - 1500)) / 600 : 0),
+    thLs: (z) => (-2 / 86400) * (z <= 1500 ? 1 : z <= 2500 ? 1 - (z - 1500) / 1000 : 0),
+    qvLs: (z) => -1.2e-8 * (z <= 300 ? 1 : z <= 500 ? 1 - (z - 300) / 200 : 0),
+    nudge: () => 0,
+  };
+  const base = buildBaseState(grid, snd);
+  const a = alloc(grid);
+  fillBase(grid, base, a);
+  perturb(grid, a, 1600, 0.1, 2.5e-5, 4242);
+  const rho = base.rho0[0];
+  return {
+    name: 'BOMEX 貿易風積雲（検証）',
+    description: '海上の浅い積雲。地表フラックス・大規模強制は固定（Siebesma et al. 2003）。',
+    reference: '参照（3〜6h）：雲底≈0.5km 雲頂≈1.5〜1.8km 最大層雲量≈5〜8% LWP≈5〜12 g/m²',
+    duration: 6 * 3600,
+    config: {
+      grid, base, moist: true, rain: false, smagorinsky: true, nuConst: 0, cs: 0.18, prandtl: 1 / 3,
+      shf: rho * 1004.5 * 8e-3, lhf: rho * 2.5e6 * 5.2e-5, forcing, fcor: 0.376e-4, frame,
+      ustar: 0.28, z0: 0.0002, spongeZ: 2500, spongeRate: 1 / 300, dtMax: 3, cfl: 0.7,
+    },
+    initial: a,
+  };
+}
+
+/** 観測地点の緯度からコリオリ係数 */
+export function coriolis(latDeg: number): number {
+  return 2 * 7.2921e-5 * Math.sin((latDeg * Math.PI) / 180);
+}
+
+/**
+ * 日射と結合した陸上の一日（地表エネルギー収支で顕熱・潜熱が決まる）。
+ * 夜明け（現地 startHour）に初期サウンディングから始め、日射で地面が温まると混合層が育ち、
+ * 条件がそろえば積雲が湧き、夕方に加熱が止まると崩れる。
+ */
+export function landDay(opts: {
+  name: string;
+  description: string;
+  sounding: 'arm' | 'wk' | 'armDry';
+  nx: number; dx: number; dzMin: number; ztop: number;
+  soilWet: number; windMs: number; latDeg: number;
+}): SimCase {
+  let theta: (z: number) => number;
+  let qv: (z: number) => number;
+  if (opts.sounding === 'wk') {
+    const ztr = 12000, thTr = 343, Ttr = 213;
+    // 夜明け前の地表付近は放射冷却で少し安定（下層 300m を最大 2K 冷やす）
+    const thWk = (z: number) => (z <= ztr ? 300 + (thTr - 300) * Math.pow(z / ztr, 1.25) : thTr * Math.exp((G / (CP * Ttr)) * (z - ztr)));
+    theta = (z) => thWk(z) - (z < 300 ? 2 * (1 - z / 300) : 0);
+    const rh = (z: number) => (z <= ztr ? 1 - 0.75 * Math.pow(z / ztr, 1.25) : 0.25);
+    qv = (z) => {
+      const pi = Math.max(0.2, 1 - (G * z) / (CP * 305));
+      const p = P00 * Math.pow(pi, 1 / KAPPA);
+      return Math.min(0.014, rh(z) * qvsat(thWk(z) * pi, p));
+    };
+  } else {
+    const zs = [0, 50, 350, 650, 700, 1300, 2500, 5500];
+    theta = profile(zs, [299.0, 301.5, 302.5, 303.53, 303.7, 307.13, 314.0, 343.2]);
+    const q = profile(zs, [15.2, 15.17, 14.98, 14.8, 14.7, 13.5, 3.0, 3.0].map((x) => x / 1000));
+    const f = opts.sounding === 'armDry' ? 0.6 : 1;
+    qv = (z) => q(z) * f;
+  }
+  const deep = opts.ztop > 8000;
+  const zf = stretchedLevels(opts.dzMin, deep ? 1500 : 3000, 1.05, deep ? 400 : 200, opts.ztop);
+  const grid = makeGrid({ nx: opts.nx, ny: opts.nx, dx: opts.dx, dy: opts.dx, zf });
+  const frame: [number, number] = [opts.windMs, 0];
+  const snd: Sounding = { surfacePressure: 100000, theta, qv, u: () => 0, v: () => 0 };
+  const zn = deep ? 9000 : 3000;
+  const forcing: LargeScaleForcing = {
+    ug: () => opts.windMs, vg: () => 0, wsub: () => 0,
+    // 晴天の大気の放射冷却（約 −1.5 K/日）。地表の長波放射は地表エネルギー収支で別に扱う
+    thLs: () => -1.5 / 86400,
+    qvLs: () => 0,
+    // 上空は数時間で元の状態へ引き戻す（周期領域で熱・水が溜まり続けるのを防ぐ）
+    nudge: (z) => (z < zn ? 0 : z < zn + 1500 ? (1 / 10800) * ((z - zn) / 1500) : 1 / 10800),
+  };
+  const base = buildBaseState(grid, snd);
+  const a = alloc(grid);
+  fillBase(grid, base, a);
+  perturb(grid, a, 500, 0.1, 1e-5, 99);
+  const t0 = base.th0[0] * base.pi0[0];
+  return {
+    name: opts.name,
+    description: opts.description,
+    diurnal: { startHour: 5.5 },
+    duration: 24 * 3600,
+    config: {
+      grid, base, moist: true, rain: true, smagorinsky: true, nuConst: 0, cs: 0.18, prandtl: 1 / 3,
+      shf: 0, lhf: 0, forcing, fcor: coriolis(opts.latDeg), frame, z0: 0.1,
+      surfaceEnergy: true,
+      surface: { albedo: 0.2, soilWet: opts.soilWet, tDeep: t0 + 1, cSoil: 2.0e5 },
+      spongeZ: opts.ztop * 0.8, spongeRate: 1 / 300, dtMax: 4, cfl: 0.7,
+    },
+    initial: a,
+  };
 }

@@ -70,6 +70,28 @@ export interface BaseState {
   u0: number[]; v0: number[];
 }
 
+/**
+ * 大規模場の強制（計算領域より大きなスケールの効果を外から与える）。
+ * 周期境界の領域では、地表から熱と水が入り続けるので、これで収支を閉じる。
+ */
+export interface LargeScaleForcing {
+  /** 地衡風（地面に対する速度）[m/s] */
+  ug: (z: number) => number;
+  vg: (z: number) => number;
+  /** 大規模な沈降（負が下降）[m/s] */
+  wsub: (z: number) => number;
+  /** θ への大規模移流＋放射の強制 [K/s] */
+  thLs: (z: number) => number;
+  /** qv への大規模移流の強制 [1/s] */
+  qvLs: (z: number) => number;
+  /** 基本場（初期サウンディング）へのナッジング率 [1/s] */
+  nudge: (z: number) => number;
+}
+
+export const NO_FORCING: LargeScaleForcing = {
+  ug: () => 0, vg: () => 0, wsub: () => 0, thLs: () => 0, qvLs: () => 0, nudge: () => 0,
+};
+
 /** 静水圧平衡をエクスナー関数で積分して基本場を作る（仮温位を使用） */
 export function buildBaseState(grid: Grid, snd: Sounding): BaseState {
   const pis = Math.pow(snd.surfacePressure / P00, KAPPA);
@@ -108,9 +130,9 @@ export function buildBaseState(grid: Grid, snd: Sounding): BaseState {
 }
 
 /** column バッファの1層あたりの要素数（common.wgsl の Col と一致させる） */
-export const COL_STRIDE = 16;
+export const COL_STRIDE = 24;
 
-export function packColumn(grid: Grid, b: BaseState): Float32Array<ArrayBuffer> {
+export function packColumn(grid: Grid, b: BaseState, f: LargeScaleForcing = NO_FORCING): Float32Array<ArrayBuffer> {
   const a = new Float32Array(grid.nz * COL_STRIDE);
   for (let k = 0; k < grid.nz; k++) {
     a.set(
@@ -118,6 +140,8 @@ export function packColumn(grid: Grid, b: BaseState): Float32Array<ArrayBuffer> 
         grid.zc[k], grid.zf[k], grid.dzc[k], grid.dzw[k],
         b.rho0[k], b.rhoF[k], b.th0[k], b.qv0[k],
         b.pi0[k], b.p0[k], b.u0[k], b.v0[k],
+        f.ug(grid.zc[k]), f.vg(grid.zc[k]), f.wsub(grid.zf[k]), f.thLs(grid.zc[k]),
+        f.qvLs(grid.zc[k]), f.nudge(grid.zc[k]), 0, 0,
         0, 0, 0, 0,
       ],
       k * COL_STRIDE,

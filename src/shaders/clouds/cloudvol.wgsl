@@ -10,7 +10,9 @@ struct Col {
   zc: f32, zf: f32, dzc: f32, dzw: f32,
   rho0: f32, rhoF: f32, th0: f32, qv0: f32,
   pi0: f32, p0: f32, u0: f32, v0: f32,
-  pad0: f32, pad1: f32, pad2: f32, pad3: f32,
+  ug: f32, vg: f32, wsub: f32, thLs: f32,       // 地衡風、大規模沈降 [m/s]、θ の大規模・放射強制 [K/s]
+  qvLs: f32, nudge: f32, pad0: f32, pad1: f32,  // qv の大規模強制 [1/s]、基本場へのナッジング率 [1/s]
+  pad2: f32, pad3: f32, pad4: f32, pad5: f32,
 };
 
 @group(0) @binding(0) var<uniform> D: Dims;
