@@ -34,6 +34,12 @@ fn csMicro(@builtin(global_invocation_id) g: vec3u) {
     let p = cl.p0;
     let pi = cl.pi0;
 
+    // --- 地表フラックス（最下層に加える）。段階5で地表エネルギー収支モデルに置き換える
+    if (k == 0u) {
+      th += dt * P.shf / (cl.rho0 * CP * pi * cl.dzc);
+      qv += dt * P.lhf / (cl.rho0 * LV * cl.dzc);
+    }
+
     // --- 雨：自動変換と捕捉（陰的、WRF と同じ形）
     if (rain) {
       let qcOld = qc;

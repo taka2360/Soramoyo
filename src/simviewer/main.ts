@@ -4,7 +4,7 @@
 import GUI from 'lil-gui';
 import { initGpu, showFatal } from '../core/gpu';
 import { CloudModel, F } from '../sim/model';
-import { type SimCase, straka, bryanFritsch, weismanKlemp } from '../sim/cases';
+import { type SimCase, straka, bryanFritsch, weismanKlemp, armCumulus } from '../sim/cases';
 import vizWgsl from '../shaders/sim/viz.wgsl?raw';
 
 const CASES: Record<string, () => SimCase> = {
@@ -13,6 +13,8 @@ const CASES: Record<string, () => SimCase> = {
   'Bryan–Fritsch 湿潤気泡 (2D, dx=100m)': () => bryanFritsch(100),
   'Weisman–Klemp 積乱雲 (3D, 128², dx=500m)': () => weismanKlemp({ nx: 128, dx: 500, dzMin: 250, shear: 10, qv0: 0.014 }),
   'Weisman–Klemp 積乱雲 (3D, 256², dx=250m)': () => weismanKlemp({ nx: 256, dx: 250, dzMin: 150, shear: 10, qv0: 0.014 }),
+  '晴天積雲 ARM SGP (3D, 128², dx=100m)': () => armCumulus({ nx: 128, dx: 100, dzMin: 40, shf: 120, lhf: 400 }),
+  '晴天積雲 ARM SGP (3D, 256², dx=100m)': () => armCumulus({ nx: 256, dx: 100, dzMin: 40, shf: 120, lhf: 400 }),
 };
 
 interface FieldDef { name: string; f: number; cmap: 0 | 1; range: [number, number] }

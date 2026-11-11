@@ -26,6 +26,9 @@ export interface ModelConfig {
   /** スポンジ層の下端 [m] と最大減衰率 [1/s] */
   spongeZ: number;
   spongeRate: number;
+  /** 地表の顕熱・潜熱フラックス [W/m²]（一定。段階5で日射と結合） */
+  shf: number;
+  lhf: number;
   /** 時間刻みの上限 [s] と目標 CFL 数 */
   dtMax: number;
   cfl: number;
@@ -109,7 +112,7 @@ export class CloudModel {
     this.layout = device.createBindGroupLayout({
       label: 'sim',
       entries: [
-        { binding: 0, visibility: C, buffer: { type: 'uniform', hasDynamicOffset: true, minBindingSize: 64 } },
+        { binding: 0, visibility: C, buffer: { type: 'uniform', hasDynamicOffset: true, minBindingSize: 80 } },
         { binding: 1, visibility: C, buffer: st('read-only-storage') },
         { binding: 2, visibility: C, buffer: st('read-only-storage') },
         { binding: 3, visibility: C, buffer: st('read-only-storage') },
@@ -152,7 +155,7 @@ export class CloudModel {
       bg = this.device.createBindGroup({
         layout: this.layout,
         entries: [
-          { binding: 0, resource: { buffer: this.paramBuf, size: 64 } },
+          { binding: 0, resource: { buffer: this.paramBuf, size: 80 } },
           { binding: 1, resource: { buffer: this.colBuf } },
           { binding: 2, resource: { buffer: this.states[nI] } },
           { binding: 3, resource: { buffer: this.states[cI] } },
@@ -174,6 +177,9 @@ export class CloudModel {
   get columnBuffer(): GPUBuffer {
     return this.colBuf;
   }
+  get diagBuffer(): GPUBuffer {
+    return this.diag;
+  }
 
   private writeParams(dt: number): void {
     const g = this.cfg.grid;
@@ -181,12 +187,13 @@ export class CloudModel {
     const flags = (c.moist ? 1 : 0) | (c.smagorinsky ? 2 : 0) | (c.rain ? 4 : 0);
     const buf = new ArrayBuffer(PARAM_SLOT * 3);
     [dt / 3, dt / 2, dt].forEach((dts, s) => {
-      const u = new Uint32Array(buf, s * PARAM_SLOT, 16);
-      const f = new Float32Array(buf, s * PARAM_SLOT, 16);
+      const u = new Uint32Array(buf, s * PARAM_SLOT, 20);
+      const f = new Float32Array(buf, s * PARAM_SLOT, 20);
       u[0] = g.nx; u[1] = g.ny; u[2] = g.nz; u[3] = this.n;
       f[4] = g.dx; f[5] = g.dy; f[6] = dts; f[7] = dt;
       u[8] = s; u[9] = flags; f[10] = c.nuConst; f[11] = c.cs;
       f[12] = c.spongeZ; f[13] = c.spongeRate; f[14] = g.ztop; f[15] = c.prandtl;
+      f[16] = c.shf; f[17] = c.lhf;
     });
     this.device.queue.writeBuffer(this.paramBuf, 0, buf);
   }
@@ -294,9 +301,10 @@ export class CloudModel {
       const so = g.nz * NSTAT;
       const precip = a[so] * cellArea;
       const clipped = a[so + 1] * cellArea;
-      const total = airWater + precip - clipped;
+      // 地表からの蒸発で入った水（一定フラックス）を差し引いて収支を見る
+      const evap = (this.cfg.lhf / LV) * area * time;
+      const total = airWater + precip - clipped - evap;
       if (Number.isNaN(this.initialWater)) this.initialWater = total;
-      void area;
       this.lastStats = {
         levels, totalWater: total, airWater, precip, clipped, ...agg,
         cloudBase, cloudTop, cloudCover: cover, meanThl: thlMass / mass, time,

@@ -25,7 +25,7 @@ export interface PanelDeps {
   onJump: () => void;
 }
 
-export function buildPanel(d: PanelDeps): { refresh: () => void } {
+export function buildPanel(d: PanelDeps): { refresh: () => void; gui: GUI } {
   const { clock, obs, rs, cam } = d;
   const gui = new GUI({ title: 'Soramoyo' });
 
@@ -85,6 +85,7 @@ export function buildPanel(d: PanelDeps): { refresh: () => void } {
   fv.add(rs, 'whiteBalance').name('太陽光を白に（色順応）');
   fv.add(rs, 'grid').name('方位・高度の目盛り');
   fv.add(rs, 'renderScale', { '50%': 0.5, '75%': 0.75, '100%': 1 }).name('描画解像度');
+  fv.add(rs, 'cloudScale', { '1/4': 0.25, '1/3': 0.333, '1/2': 0.5, '等倍': 1 }).name('雲の描画解像度');
 
   window.addEventListener('keydown', (e) => {
     if ((e.target as HTMLElement).tagName === 'INPUT') return;
@@ -107,5 +108,5 @@ export function buildPanel(d: PanelDeps): { refresh: () => void } {
       hourCtl.updateDisplay();
     }
   };
-  return { refresh };
+  return { refresh, gui };
 }

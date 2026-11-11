@@ -7,6 +7,22 @@
 
 fn preExposure() -> f32 { return 1.0 / max(expo[0], 1e-4); }
 
+// 雲（clouds.wgsl の出力：rgb = 散乱光（プリエクスポージャー済み）, a = 透過率）と地面の雲の影
+@group(0) @binding(11) var cloudTex: texture_2d<f32>;
+@group(0) @binding(12) var shadowVol: texture_3d<f32>;
+@group(0) @binding(13) var zmap: texture_2d<f32>;
+@group(0) @binding(15) var<uniform> C: CloudU;
+@group(0) @binding(16) var smpRep: sampler;
+
+// 地点 p（地球中心基準 km）の地表での、雲による太陽光の透過率
+fn cloudShadowAtGround(p: vec3f) -> f32 {
+  if (C.enabled < 0.5) { return 1.0; }
+  let lx = p.x * 1000.0 - C.origin.x;
+  let ly = p.y * 1000.0 - C.origin.y;
+  let uvw = vec3f(lx / C.size.x, ly / C.size.y, zToW(zmap, 1.0, C.ztop, C.nz));
+  return exp(-textureSampleLevel(shadowVol, smpRep, uvw, 0.0).r);
+}
+
 // 半精度の上限を超えないよう、色相を保ったまま上限で頭打ちにする
 fn toHdr(L: vec3f) -> vec3f {
   let v = L * preExposure();
@@ -14,78 +30,12 @@ fn toHdr(L: vec3f) -> vec3f {
   return select(v, v * (60000.0 / m), m > 60000.0);
 }
 
-// ---------------------------------------------------------------- Bruneton の描画関数
-struct SkyOut { radiance: vec3f, transmittance: vec3f };
-
-fn skyScattering(r: f32, mu: f32, muS: f32, nu: f32, hitGround: bool) -> vec3f {
-  let ray = sampleScattering(rayleighTex, r, mu, muS, nu, hitGround);
-  let mie = sampleScattering(mieTex, r, mu, muS, nu, hitGround);
-  return ray * rayleighPhase(nu) + mie * miePhase(A.mie_g, nu);
-}
-
-fn getSkyRadiance(camIn: vec3f, view: vec3f, sun: vec3f) -> SkyOut {
-  var o: SkyOut;
-  var cam = camIn;
-  var r = length(cam);
-  var rmu = dot(cam, view);
-  let distToTop = -rmu - sqrt(rmu * rmu - r * r + A.top_radius * A.top_radius);
-  if (distToTop > 0.0) {
-    cam = cam + view * distToTop;
-    r = A.top_radius;
-    rmu += distToTop;
-  } else if (r > A.top_radius) {
-    o.radiance = vec3f(0.0);
-    o.transmittance = vec3f(1.0);
-    return o;
-  }
-  let mu = rmu / r;
-  let muS = dot(cam, sun) / r;
-  let nu = dot(view, sun);
-  let hitGround = rayIntersectsGround(r, mu);
-  o.transmittance = select(getTransmittanceToTop(r, mu), vec3f(0.0), hitGround);
-  o.radiance = skyScattering(r, mu, muS, nu, hitGround);
-  return o;
-}
-
-fn getSkyRadianceToPoint(camIn: vec3f, point: vec3f, sun: vec3f) -> SkyOut {
-  var o: SkyOut;
-  let view = normalize(point - camIn);
-  var cam = camIn;
-  var r = length(cam);
-  var rmu = dot(cam, view);
-  let distToTop = -rmu - sqrt(rmu * rmu - r * r + A.top_radius * A.top_radius);
-  if (distToTop > 0.0) {
-    cam = cam + view * distToTop;
-    r = A.top_radius;
-    rmu += distToTop;
-  }
-  let mu = rmu / r;
-  let muS = dot(cam, sun) / r;
-  let nu = dot(view, sun);
-  let d = length(point - cam);
-  let hitGround = rayIntersectsGround(r, mu);
-  o.transmittance = getTransmittance(r, mu, d, hitGround);
-
-  let ray0 = sampleScattering(rayleighTex, r, mu, muS, nu, hitGround);
-  let mie0 = sampleScattering(mieTex, r, mu, muS, nu, hitGround);
-  let rP = clampRadius(sqrt(d * d + 2.0 * r * mu * d + r * r));
-  let muP = (r * mu + d) / rP;
-  let muSP = (r * muS + d * nu) / rP;
-  let ray1 = sampleScattering(rayleighTex, rP, muP, muSP, nu, hitGround);
-  let mie1 = sampleScattering(mieTex, rP, muP, muSP, nu, hitGround);
-  let ray = max(ray0 - o.transmittance * ray1, vec3f(0.0));
-  var mie = max(mie0 - o.transmittance * mie1, vec3f(0.0));
-  mie *= smoothstep(0.0, 0.01, muS); // Bruneton と同じ：地平線下の太陽での Mie の誤差を抑える
-  o.radiance = ray * rayleighPhase(nu) + mie * miePhase(A.mie_g, nu);
-  return o;
-}
-
 // 地表の照度（直達・天空）[lx]
 fn sunAndSkyIrradiance(p: vec3f, n: vec3f, sun: vec3f) -> array<vec3f, 2> {
   let r = length(p);
   let muS = dot(p, sun) / r;
   let sky = getIrradiance(r, muS) * (1.0 + dot(n, p) / r) * 0.5;
-  let direct = F.sunIllum * getTransmittanceToSun(r, muS) * max(dot(n, sun), 0.0);
+  let direct = F.sunIllum * getTransmittanceToSun(r, muS) * max(dot(n, sun), 0.0) * cloudShadowAtGround(p);
   return array<vec3f, 2>(direct, sky);
 }
 
@@ -155,7 +105,13 @@ fn fsMain(in: VsOut) -> @location(0) vec4f {
     // 目盛りは画面の明るさに合わせて見える強さで重ねる（露出に追従させるため相対値）
     L = mix(L, vec3f(luminance(L) * 2.5 + 1e-4), g * 0.35);
   }
-  return vec4f(toHdr(L), 1.0);
+  // 雲を合成（雲テクスチャは半解像度。双線形で拡大）
+  let cuv = in.pos.xy / F.resolution;
+  let cl = textureSampleLevel(cloudTex, smp, cuv, 0.0);
+  var outc = toHdr(L) * cl.a + cl.rgb;
+  let m = max(outc.r, max(outc.g, outc.b));
+  outc = select(outc, outc * (60000.0 / m), m > 60000.0);
+  return vec4f(outc, 1.0);
 }
 
 fn gridLine(v: f32, spacing: f32, widthPx: f32) -> f32 {

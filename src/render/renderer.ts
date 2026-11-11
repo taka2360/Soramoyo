@@ -4,10 +4,14 @@ import type { AtmosphereLut } from '../atmosphere/atmosphere';
 import { BOTTOM_RADIUS_KM } from '../atmosphere/atmosphere';
 import commonWgsl from '../shaders/common.wgsl?raw';
 import atmoFunctionsWgsl from '../shaders/atmosphere/functions.wgsl?raw';
+import atmoRenderWgsl from '../shaders/atmosphere/render.wgsl?raw';
+import cloudCommonWgsl from '../shaders/clouds/cloudcommon.wgsl?raw';
+import cloudsWgsl from '../shaders/clouds/clouds.wgsl?raw';
 import skyWgsl from '../shaders/sky.wgsl?raw';
 import exposureWgsl from '../shaders/exposure.wgsl?raw';
 import tonemapWgsl from '../shaders/tonemap.wgsl?raw';
 import { GpuTimer } from './gpuTimer';
+import type { CloudVolume } from './clouds';
 
 export const HDR_FORMAT: GPUTextureFormat = 'rgba16float';
 const FRAME_FLOATS = 40;
@@ -19,6 +23,8 @@ export interface RenderSettings {
   grid: boolean;
   /** 描画解像度の倍率（画質設定） */
   renderScale: number;
+  /** 雲の描画解像度（画面に対する比） */
+  cloudScale: number;
   /** 太陽光を白とみなす色順応 */
   whiteBalance: boolean;
 }
@@ -30,7 +36,7 @@ export interface SceneState {
   sunDir: number[];
   sunDirApparent: number[];
   sunAngularRadius: number;
-  /** 大気上端の太陽照度（線形 sRGB, lx）。地球–太陽距離の補正込み */
+  /** 大気上端の太陽照度（線形 sRGB, lx） */
   sunIlluminance: number[];
   whitePoint: number[];
   groundAlbedo: number;
@@ -39,71 +45,83 @@ export interface SceneState {
 
 /**
  * 描画パイプライン：
- *   [空・地面] → HDR(rgba16float, cd/m²) → [自動露出] → [トーンマップ] → キャンバス
- * 段階4以降で、空と地面の間に雲レイマーチ（半解像度+TAA）が入る。
+ *   [雲（低解像度）] → [空・地面 ＋ 雲の合成] → HDR(rgba16float) → [自動露出] → [トーンマップ] → キャンバス
  */
 export class Renderer {
   private frameBuf: GPUBuffer;
+  private cloudFrameBuf: GPUBuffer;
   private frameData = new Float32Array(FRAME_FLOATS);
   private expoBuf: GPUBuffer;
   private skyPipe: GPURenderPipeline;
+  private cloudPipe: GPURenderPipeline;
   private expoPipe: GPUComputePipeline;
   private tonePipe: GPURenderPipeline;
-  private skyBind?: GPUBindGroup;
-  private skyBindGen = -1;
+  private skyBind: GPUBindGroup[] = [];
+  private cloudBind: GPUBindGroup[] = [];
+  private parity = 0;
+  private bindKey = '';
   private expoBind!: GPUBindGroup;
   private toneBind!: GPUBindGroup;
   private hdr!: GPUTexture;
+  private cloudTargets: GPUTexture[] = [];
   private width = 0;
   private height = 0;
+  private cw = 0;
+  private ch = 0;
   readonly timer: GpuTimer;
 
-  constructor(private gpu: Gpu, private canvas: HTMLCanvasElement, private atmo: AtmosphereLut) {
+  constructor(private gpu: Gpu, private canvas: HTMLCanvasElement, private atmo: AtmosphereLut, private clouds: CloudVolume) {
     const { device } = gpu;
-    this.frameBuf = device.createBuffer({ size: FRAME_FLOATS * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const U = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
+    this.frameBuf = device.createBuffer({ size: FRAME_FLOATS * 4, usage: U });
+    this.cloudFrameBuf = device.createBuffer({ size: FRAME_FLOATS * 4, usage: U });
     this.expoBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
 
-    const skyMod = device.createShaderModule({ label: 'sky', code: atmoFunctionsWgsl + commonWgsl + skyWgsl });
-    this.skyPipe = device.createRenderPipeline({
-      label: 'sky',
-      layout: 'auto',
-      vertex: { module: skyMod, entryPoint: 'vsFullscreen' },
-      fragment: { module: skyMod, entryPoint: 'fsMain', targets: [{ format: HDR_FORMAT }] },
-      primitive: { topology: 'triangle-list' },
-    });
-
+    const fs = (label: string, code: string, format: GPUTextureFormat) => {
+      const module = device.createShaderModule({ label, code });
+      return device.createRenderPipeline({
+        label,
+        layout: 'auto',
+        vertex: { module, entryPoint: 'vsFullscreen' },
+        fragment: { module, entryPoint: 'fsMain', targets: [{ format }] },
+        primitive: { topology: 'triangle-list' },
+      });
+    };
+    const atmoBase = atmoFunctionsWgsl + atmoRenderWgsl + commonWgsl + cloudCommonWgsl;
+    this.skyPipe = fs('sky', atmoBase + skyWgsl, HDR_FORMAT);
+    this.cloudPipe = fs('clouds', atmoBase + cloudsWgsl, HDR_FORMAT);
+    this.tonePipe = fs('tonemap', commonWgsl + tonemapWgsl, gpu.canvasFormat);
     const expoMod = device.createShaderModule({ label: 'exposure', code: commonWgsl + exposureWgsl });
     this.expoPipe = device.createComputePipeline({ label: 'exposure', layout: 'auto', compute: { module: expoMod, entryPoint: 'csMain' } });
 
-    const toneMod = device.createShaderModule({ label: 'tonemap', code: commonWgsl + tonemapWgsl });
-    this.tonePipe = device.createRenderPipeline({
-      label: 'tonemap',
-      layout: 'auto',
-      vertex: { module: toneMod, entryPoint: 'vsFullscreen' },
-      fragment: { module: toneMod, entryPoint: 'fsMain', targets: [{ format: gpu.canvasFormat }] },
-      primitive: { topology: 'triangle-list' },
-    });
-
-    this.timer = new GpuTimer(device, gpu.hasTimestamps, ['sky', 'exposure', 'tonemap']);
+    this.timer = new GpuTimer(device, gpu.hasTimestamps, ['clouds', 'sky', 'exposure', 'tonemap']);
   }
 
-  private resize(scale: number): void {
+  private resize(scale: number, cloudScale: number): void {
     const dpr = Math.min(window.devicePixelRatio || 1, 2) * scale;
     const w = Math.max(1, Math.floor(this.canvas.clientWidth * dpr));
     const h = Math.max(1, Math.floor(this.canvas.clientHeight * dpr));
-    if (w === this.width && h === this.height) return;
+    const cw = Math.max(1, Math.floor(w * cloudScale));
+    const ch = Math.max(1, Math.floor(h * cloudScale));
+    if (w === this.width && h === this.height && cw === this.cw && ch === this.ch) return;
     this.width = w;
     this.height = h;
+    this.cw = cw;
+    this.ch = ch;
     this.canvas.width = w;
     this.canvas.height = h;
+    const { device } = this.gpu;
     this.hdr?.destroy();
-    this.hdr = this.gpu.device.createTexture({
-      label: 'hdr',
-      size: [w, h],
-      format: HDR_FORMAT,
+    this.cloudTargets.forEach((t) => t.destroy());
+    this.hdr = device.createTexture({
+      label: 'hdr', size: [w, h], format: HDR_FORMAT,
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
-    const { device } = this.gpu;
+    // 雲は2枚を交互に使う（前フレームの結果を履歴として読む）
+    this.cloudTargets = [0, 1].map((i) => device.createTexture({
+      label: `clouds${i}`, size: [cw, ch], format: HDR_FORMAT,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    }));
     this.expoBind = device.createBindGroup({
       layout: this.expoPipe.getBindGroupLayout(0),
       entries: [
@@ -120,27 +138,52 @@ export class Renderer {
         { binding: 2, resource: { buffer: this.expoBuf } },
       ],
     });
+    this.bindKey = '';
   }
 
-  private ensureSkyBind(): boolean {
+  private ensureBinds(): boolean {
     const a = this.atmo;
+    const c = this.clouds;
     if (a.generation === 0) return false;
-    if (this.skyBindGen !== a.generation) {
-      this.skyBind = this.gpu.device.createBindGroup({
-        layout: this.skyPipe.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: { buffer: a.uniform } },
-          { binding: 1, resource: a.sampler },
-          { binding: 2, resource: a.transmittance.createView() },
-          { binding: 3, resource: a.irradiance.createView() },
-          { binding: 4, resource: a.scattering.createView() },
-          { binding: 5, resource: a.singleMie.createView() },
-          { binding: 9, resource: { buffer: this.frameBuf } },
-          { binding: 10, resource: { buffer: this.expoBuf } },
-        ],
-      });
-      this.skyBindGen = a.generation;
-    }
+    const key = `${a.generation}/${c.generation}/${this.width}x${this.height}/${this.cw}`;
+    if (key === this.bindKey) return true;
+    const atmoEntries = (frame: GPUBuffer): GPUBindGroupEntry[] => [
+      { binding: 0, resource: { buffer: a.uniform } },
+      { binding: 1, resource: a.sampler },
+      { binding: 2, resource: a.transmittance.createView() },
+      { binding: 3, resource: a.irradiance.createView() },
+      { binding: 4, resource: a.scattering.createView() },
+      { binding: 5, resource: a.singleMie.createView() },
+      { binding: 9, resource: { buffer: frame } },
+      { binding: 10, resource: { buffer: this.expoBuf } },
+    ];
+    const d = this.gpu.device;
+    // parity p：雲を cloudTargets[p] に描き、履歴として cloudTargets[1-p] を読む
+    this.skyBind = [0, 1].map((p) => d.createBindGroup({
+      layout: this.skyPipe.getBindGroupLayout(0),
+      entries: [
+        ...atmoEntries(this.frameBuf),
+        { binding: 11, resource: this.cloudTargets[p].createView() },
+        { binding: 12, resource: c.shadow.createView() },
+        { binding: 13, resource: c.zmap.createView() },
+        { binding: 15, resource: { buffer: c.uniform } },
+        { binding: 16, resource: c.samplerRepeat },
+      ],
+    }));
+    this.cloudBind = [0, 1].map((p) => d.createBindGroup({
+      layout: this.cloudPipe.getBindGroupLayout(0),
+      entries: [
+        ...atmoEntries(this.cloudFrameBuf),
+        { binding: 11, resource: c.vol.createView() },
+        { binding: 12, resource: c.shadow.createView() },
+        { binding: 13, resource: c.zmap.createView() },
+        { binding: 14, resource: c.noise.createView() },
+        { binding: 15, resource: { buffer: c.uniform } },
+        { binding: 16, resource: c.samplerRepeat },
+        { binding: 17, resource: this.cloudTargets[1 - p].createView() },
+      ],
+    }));
+    this.bindKey = key;
     return true;
   }
 
@@ -153,36 +196,46 @@ export class Renderer {
     this.gpu.device.queue.writeBuffer(this.expoBuf, 0, new Float32Array([0, 0, 0, 0]));
   }
 
-  render(cam: Camera, s: RenderSettings, sc: SceneState, dtReal: number, timeSec: number): void {
-    this.resize(s.renderScale);
-    if (!this.ensureSkyBind()) return;
-    const { device } = this.gpu;
+  private packFrame(cam: Camera, s: RenderSettings, sc: SceneState, dtReal: number, timeSec: number, w: number, h: number): Float32Array<ArrayBuffer> {
     const { fwd, right, up } = cam.basis();
     const camR = BOTTOM_RADIUS_KM + (sc.groundElevationM + cam.heightM) / 1000;
-    const f = this.frameData;
+    const f = new Float32Array(FRAME_FLOATS);
     const wp = s.whiteBalance ? sc.whitePoint : [1, 1, 1];
     f.set([...fwd, Math.tan(cam.fovY * 0.5)], 0);
-    f.set([...right, this.width / this.height], 4);
+    f.set([...right, w / h], 4);
     f.set([...up, s.exposureEV], 8);
     f.set([0, 0, camR, s.autoExposure ? 1 : 0], 12);
     f.set([...sc.sunDir, sc.sunAngularRadius], 16);
     f.set([...sc.sunDirApparent, dtReal], 20);
     f.set([...sc.sunIlluminance, s.grid ? 1 : 0], 24);
     f.set([...wp, timeSec % 3600], 28);
-    f.set([this.width, this.height, sc.groundAlbedo, sc.refractionScale], 32);
-    device.queue.writeBuffer(this.frameBuf, 0, f);
+    f.set([w, h, sc.groundAlbedo, sc.refractionScale], 32);
+    return f;
+  }
+
+  render(cam: Camera, s: RenderSettings, sc: SceneState, dtReal: number, timeSec: number): void {
+    this.resize(s.renderScale, s.cloudScale);
+    if (!this.ensureBinds()) return;
+    const { device } = this.gpu;
+    this.frameData = this.packFrame(cam, s, sc, dtReal, timeSec, this.width, this.height);
+    device.queue.writeBuffer(this.frameBuf, 0, this.frameData);
+    device.queue.writeBuffer(this.cloudFrameBuf, 0, this.packFrame(cam, s, sc, dtReal, timeSec, this.cw, this.ch));
 
     const enc = device.createCommandEncoder();
-    {
+    const fullscreen = (view: GPUTextureView, pipe: GPURenderPipeline, bg: GPUBindGroup, timerName: string, clear: number[]) => {
       const pass = enc.beginRenderPass({
-        colorAttachments: [{ view: this.hdr.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }],
-        timestampWrites: this.timer.writes('sky'),
+        colorAttachments: [{ view, loadOp: 'clear', storeOp: 'store', clearValue: clear }],
+        timestampWrites: this.timer.writes(timerName),
       });
-      pass.setPipeline(this.skyPipe);
-      pass.setBindGroup(0, this.skyBind!);
+      pass.setPipeline(pipe);
+      pass.setBindGroup(0, bg);
       pass.draw(3);
       pass.end();
-    }
+    };
+    this.parity = 1 - this.parity;
+    const p = this.parity;
+    fullscreen(this.cloudTargets[p].createView(), this.cloudPipe, this.cloudBind[p], 'clouds', [0, 0, 0, 1]);
+    fullscreen(this.hdr.createView(), this.skyPipe, this.skyBind[p], 'sky', [0, 0, 0, 1]);
     {
       const pass = enc.beginComputePass({ timestampWrites: this.timer.computeWrites('exposure') });
       pass.setPipeline(this.expoPipe);
@@ -190,18 +243,7 @@ export class Renderer {
       pass.dispatchWorkgroups(1);
       pass.end();
     }
-    {
-      const pass = enc.beginRenderPass({
-        colorAttachments: [
-          { view: this.gpu.context.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] },
-        ],
-        timestampWrites: this.timer.writes('tonemap'),
-      });
-      pass.setPipeline(this.tonePipe);
-      pass.setBindGroup(0, this.toneBind);
-      pass.draw(3);
-      pass.end();
-    }
+    fullscreen(this.gpu.context.getCurrentTexture().createView(), this.tonePipe, this.toneBind, 'tonemap', [0, 0, 0, 1]);
     this.timer.resolve(enc);
     device.queue.submit([enc.finish()]);
     this.timer.readback();

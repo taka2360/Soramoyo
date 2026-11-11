@@ -33,6 +33,7 @@ struct Params {
   dx: f32, dy: f32, dt: f32, dtFull: f32,   // dt = この RK 段の刻み、dtFull = 1ステップの刻み
   stage: u32, flags: u32, nuConst: f32, cs: f32,
   spongeZ: f32, spongeRate: f32, ztop: f32, prandtl: f32,
+  shf: f32, lhf: f32, pad0: f32, pad1: f32,   // 地表の顕熱・潜熱フラックス [W/m²]
 };
 
 struct Col {

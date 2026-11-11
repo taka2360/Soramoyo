@@ -68,7 +68,7 @@ export function straka(dx = 100): SimCase {
     description: '冷気塊が落下して地表を広がる。900秒で前線 ≈15.5km、最小θ′ ≈ −9.8K が標準解（圧縮性モデル）。',
     duration: 900,
     config: {
-      grid, base, moist: false, rain: false, smagorinsky: false, nuConst: 75, cs: 0.18, prandtl: 1,
+      grid, base, moist: false, rain: false, smagorinsky: false, nuConst: 75, cs: 0.18, prandtl: 1, shf: 0, lhf: 0,
       spongeZ: 1e9, spongeRate: 0, dtMax: 1.0, cfl: 0.8,
     },
     initial: a,
@@ -142,7 +142,7 @@ export function bryanFritsch(dx = 100): SimCase {
     description: '飽和した湿潤中立の大気中で暖気泡が上昇。凝結熱で加速しながら雲の中を昇る（雨なし）。',
     duration: 1000,
     config: {
-      grid, base, moist: true, rain: false, smagorinsky: true, nuConst: 0, cs: 0.18, prandtl: 1 / 3,
+      grid, base, moist: true, rain: false, smagorinsky: true, nuConst: 0, cs: 0.18, prandtl: 1 / 3, shf: 0, lhf: 0,
       spongeZ: 1e9, spongeRate: 0, dtMax: 1.0, cfl: 0.8,
     },
     initial: a,
@@ -216,9 +216,63 @@ export function weismanKlemp(opts: { nx: number; dx: number; dzMin: number; shea
     description: `条件付き不安定な大気に暖気泡を置く。積雲→積乱雲→降水。シア ${us} m/s、地表 qv ${opts.qv0 * 1000} g/kg。`,
     duration: 7200,
     config: {
-      grid, base, moist: true, rain: true, smagorinsky: true, nuConst: 0, cs: 0.18, prandtl: 1 / 3,
+      grid, base, moist: true, rain: true, smagorinsky: true, nuConst: 0, cs: 0.18, prandtl: 1 / 3, shf: 0, lhf: 0,
       spongeZ: 15000, spongeRate: 1 / 300, dtMax: 6, cfl: 0.8,
     },
     initial: a,
   };
+}
+
+// ---------------------------------------------------------------------------
+/**
+ * 陸上の晴天積雲：ARM SGP（米国中部, 1997/6/21）の初期サウンディング（Brown et al. 2002）。
+ * 地表加熱（顕熱・潜熱フラックス）で対流混合層が育ち、持ち上げ凝結高度に達すると積雲が湧く。
+ * 段階4では地表フラックスは一定値（正午付近の値）。段階5で日射・地表エネルギー収支と結合する。
+ */
+export function armCumulus(opts: { nx: number; dx: number; dzMin: number; shf: number; lhf: number }): SimCase {
+  const zs = [0, 50, 350, 650, 700, 1300, 2500, 5500];
+  const ths = [299.0, 301.5, 302.5, 303.53, 303.7, 307.13, 314.0, 343.2];
+  const qts = [15.2, 15.17, 14.98, 14.8, 14.7, 13.5, 3.0, 3.0].map((q) => q / 1000);
+  const lerp = (arr: number[]) => (z: number) => {
+    if (z <= zs[0]) return arr[0];
+    for (let i = 1; i < zs.length; i++) {
+      if (z <= zs[i]) return arr[i - 1] + ((arr[i] - arr[i - 1]) * (z - zs[i - 1])) / (zs[i] - zs[i - 1]);
+    }
+    const n = zs.length - 1;
+    return arr[n] + ((arr[n] - arr[n - 1]) * (z - zs[n])) / (zs[n] - zs[n - 1]);
+  };
+  const zf = stretchedLevels(opts.dzMin, 3000, 1.06, 250, 6000);
+  const grid = makeGrid({ nx: opts.nx, ny: opts.nx, dx: opts.dx, dy: opts.dx, zf });
+  // 平均風 u=10 m/s で動く座標系で計算する（領域ごと東へ流れる）
+  const snd: Sounding = { surfacePressure: 97000, theta: lerp(ths), qv: lerp(qts), u: () => 0, v: () => 0 };
+  const base = buildBaseState(grid, snd);
+  const a = alloc(grid);
+  fillBase(grid, base, a);
+  const n = grid.nx * grid.ny * grid.nz;
+  const plane = grid.nx * grid.ny;
+  const r = rng(777);
+  for (let k = 0; k < grid.nz; k++) {
+    if (grid.zc[k] > 500) break;
+    for (let p = 0; p < plane; p++) {
+      a[F.TH * n + p + plane * k] += (r() - 0.5) * 0.2;
+      a[F.QV * n + p + plane * k] += (r() - 0.5) * 2e-5;
+    }
+  }
+  return {
+    name: '陸上の晴天積雲（ARM SGP 型）',
+    description: `地表加熱で混合層が育ち、積雲が湧く。顕熱 ${opts.shf} W/m²・潜熱 ${opts.lhf} W/m²（一定）。平均風 10 m/s。`,
+    duration: 4 * 3600,
+    config: {
+      grid, base, moist: true, rain: true, smagorinsky: true, nuConst: 0, cs: 0.18, prandtl: 1 / 3,
+      shf: opts.shf, lhf: opts.lhf, spongeZ: 4500, spongeRate: 1 / 300, dtMax: 3, cfl: 0.7,
+    },
+    initial: a,
+  };
+}
+
+/** 平均風（移動座標系の速度）[m/s]。ケースごとに描画側で領域を動かすのに使う */
+export function caseMeanWind(name: string): [number, number] {
+  if (name.startsWith('陸上の晴天積雲')) return [10, 0];
+  if (name.startsWith('Weisman')) return [5, 0];
+  return [0, 0];
 }
