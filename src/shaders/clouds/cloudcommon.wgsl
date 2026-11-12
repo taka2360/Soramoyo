@@ -95,3 +95,27 @@ fn sampleVolSmooth3(tex: texture_3d<f32>, s: sampler, uvw: vec3f) -> vec4f {
   }
   return r;
 }
+
+// ---------------------------------------------------------------- 遠方タイルの反転
+// 計算領域（水平に周期的）を並べて地平線まで埋めるとき、同じ雲が等間隔に並んで見えないよう、
+// タイルごとに左右・上下を反転する。反転の有無は x 方向は列番号だけ、y 方向は行番号だけで決める
+// （そうすれば隣り合うタイルの継ぎ目で値が連続する）。最初のタイル（0, 0）は反転しない。
+// 反転したタイルでは太陽の向きも反転した影が必要なので、影テクスチャは4通り作ってある。
+fn tileFlipOf(t: f32, seed: f32) -> f32 {
+  if (t == 0.0) { return 0.0; }
+  return step(0.5, fract(sin(t * 12.9898 + seed) * 43758.5453));
+}
+// 領域原点からの位置 (lx, ly) → (タイル内の u, v（反転済み）, x 反転, y 反転)
+fn tileMap(lx: f32, ly: f32, size: vec2f) -> vec4f {
+  let a = vec2f(lx / size.x, ly / size.y);
+  let t = floor(a);
+  let fl = vec2f(tileFlipOf(t.x, 1.7), tileFlipOf(t.y, 5.3));
+  let f = a - t;
+  return vec4f(mix(f, vec2f(1.0) - f, fl), fl);
+}
+// 影テクスチャ：s = (反転なし, 真上, x 反転, -)、s2 = (y 反転, xy 反転, -, -) の太陽方向の光学的厚さ
+fn pickSunOd(s: vec4f, s2: vec4f, fl: vec2f) -> f32 {
+  let noY = mix(s.r, s.b, fl.x);
+  let yy = mix(s2.r, s2.g, fl.x);
+  return mix(noY, yy, fl.y);
+}

@@ -7,6 +7,7 @@
 @group(0) @binding(10) var<storage, read> expo: array<f32, 4>;
 @group(0) @binding(11) var vol: texture_3d<f32>;
 @group(0) @binding(12) var shadowVol: texture_3d<f32>;
+@group(0) @binding(20) var shadowVol2: texture_3d<f32>;
 @group(0) @binding(13) var zmap: texture_2d<f32>;
 @group(0) @binding(14) var noiseTex: texture_3d<f32>;
 @group(0) @binding(15) var<uniform> C: CloudU;
@@ -64,14 +65,20 @@ fn icePhase(c: f32) -> f32 {
   return 0.97 * hg(0.75, c) + 0.03 * halo;
 }
 
-fn domainUvw(p: vec3f, h: f32) -> vec3f {
-  return vec3f((p.x - C.origin.x) / C.size.x, (p.y - C.origin.y) / C.size.y, zToW(zmap, h, C.ztop, C.nz));
+// 世界の点 q（高さ hq）での、太陽方向の光学的厚さ（影テクスチャ。遠方タイルの反転込み）
+fn sunShadowAt(q: vec3f, hq: f32, smoothB: bool) -> f32 {
+  let tm = tileMap(q.x - C.origin.x, q.y - C.origin.y, C.size);
+  let uvw = vec3f(tm.xy, zToW(zmap, hq, C.ztop, C.nz));
+  if (smoothB) {
+    return pickSunOd(sampleVolSmooth3(shadowVol, smpRep, uvw), sampleVolSmooth3(shadowVol2, smpRep, uvw), tm.zw);
+  }
+  return pickSunOd(textureSampleLevel(shadowVol, smpRep, uvw, 0.0), textureSampleLevel(shadowVol2, smpRep, uvw, 0.0), tm.zw);
 }
 
-// 太陽方向の光学的厚さ：近い範囲（格子2つ分）は細かく辿り、その先は前計算した影テクスチャ。
+// 太陽方向の光学的厚さ：近い範囲（格子3つ分）は細かく辿り、その先は前計算した影テクスチャ。
 // 影テクスチャだけだと、粗い格子の補間で雲の縁に内部の大きな値が混ざり、日の当たる面が暗くなるため。
 fn sunOpticalDepth(p: vec3f, sun: vec3f) -> f32 {
-  let reach = 2.0 * C.cellSize;
+  let reach = 3.0 * C.cellSize;  // 影テクスチャは水平が格子2個分の解像度なので、近くは格子3個分を直接たどる
   var od = 0.0;
   var t = 0.0;
   for (var i = 0; i < 6; i++) {
@@ -84,8 +91,7 @@ fn sunOpticalDepth(p: vec3f, sun: vec3f) -> f32 {
   let hq = max(altitude(q) + gOff.z, 0.0);
   if (hq > C.slabTop) { return od; }
   // 影テクスチャも細部合成と同じ位置のずれで、近くは3次 B スプラインで読む（線形補間の四角い影を避ける）
-  if (gDist < 15000.0 * C.detailHQ) { return od + sampleVolSmooth3(shadowVol, smpRep, domainUvw(q, hq)).r; }
-  return od + textureSampleLevel(shadowVol, smpRep, domainUvw(q, hq), 0.0).r;
+  return od + sunShadowAt(q, hq, gDist < 15000.0 * C.detailHQ);
 }
 
 // 細部合成のノイズ。雲水（積雲）は上昇流で「もこもこ」（Worley の粒）、下降流・蒸発域で「すじ・ちぎれ」（Perlin–Worley）。
@@ -114,12 +120,13 @@ fn detailNoise(p: vec3f, up: f32, ice: f32, turb: f32) -> f32 {
 // 境界の幅 w は近くで細く（鋭い縁）、遠くで太く（エイリアシング防止。w が大きいと格子の値そのものに近づく）。
 // ノイズは各点の風（計算領域に対する相対速度）で流す。長く流すと歪むので、
 // 位相を半周期ずらした2組を交互にリセットして重ねる（flow map の手法）。
-fn detailKeep(p: vec3f, uvw: vec3f, lwc: f32, iwc: f32, nu: f32) -> f32 {
+fn detailKeep(p: vec3f, uvw: vec3f, fl: vec2f, lwc: f32, iwc: f32, nu: f32) -> f32 {
   let ice = select(0.0, 1.0, iwc > lwc);
   let q = max(lwc, iwc);
   let cf = q / mix(0.3, 0.05, ice);
   if (cf >= 1.0) { return 1.0; }
-  let vel = textureSampleLevel(velVol, smpRep, uvw, 0.0).xyz;
+  var vel = textureSampleLevel(velVol, smpRep, uvw, 0.0).xyz;
+  vel = vec3f(vel.xy * (vec2f(1.0) - 2.0 * fl), vel.z);  // 反転したタイルでは風の向きも反転
   let up = smoothstep(-0.3, 1.2, vel.z);
   let Tp = 30.0;  // 長いと風の差で模様が引き伸ばされて筋になる
   let ph = fract(C.time / Tp);
@@ -138,7 +145,8 @@ fn sampleMedium(p: vec3f, h: f32, withShadow: bool) -> Medium {
   var m: Medium;
   let lx = p.x - C.origin.x;
   let ly = p.y - C.origin.y;
-  var uvw = vec3f(lx / C.size.x, ly / C.size.y, zToW(zmap, h, C.ztop, C.nz));
+  var tm = tileMap(lx, ly, C.size);
+  var uvw = vec3f(tm.xy, zToW(zmap, h, C.ztop, C.nz));
   var v = sampleVolSmoothZ(vol, smpRep, uvw);
   if (withShadow) { gOff = vec3f(0.0); }
   // 雲の近くでは読む位置をノイズで格子1個分ほどずらす（ドメインワープ）。
@@ -153,7 +161,8 @@ fn sampleMedium(p: vec3f, h: f32, withShadow: bool) -> Medium {
     let off = (smoothstep(vec3f(0.3), vec3f(0.8), vec3f(nw.b, nw2.b, nw.a)) - vec3f(0.5)) * 2.0 * amp;
     let pw = vec3f(lx + off.x, ly + off.y, max(h + 0.5 * off.z, 0.0));
     if (withShadow) { gOff = vec3f(off.xy, 0.5 * off.z); }
-    uvw = vec3f(pw.x / C.size.x, pw.y / C.size.y, zToW(zmap, pw.z, C.ztop, C.nz));
+    tm = tileMap(pw.x, pw.y, C.size);
+    uvw = vec3f(tm.xy, zToW(zmap, pw.z, C.ztop, C.nz));
     if (gDist < 15000.0 * C.detailHQ) { v = sampleVolSmooth3(vol, smpRep, uvw); }
     else { v = sampleVolSmoothZ(vol, smpRep, uvw); }
   }
@@ -165,7 +174,7 @@ fn sampleMedium(p: vec3f, h: f32, withShadow: bool) -> Medium {
   // ---- 細部合成：格子（50〜250 m）より細かい縁の凹凸。雲の量・大きさ・寿命は計算どおりで、縁の形だけを足す。
   var pr = v.b;
   if (C.detail > 0.0 && mL + mI > 0.0) {
-    let keep = detailKeep(vec3f(lx, ly, h), uvw, lwc * mL, iwc * mI, v.a);
+    let keep = detailKeep(vec3f(lx, ly, h), uvw, tm.zw, lwc * mL, iwc * mI, v.a);
     // 雲の中にある降水（積乱雲の中の雪・あられ）も雲と同じ形で。雲の外の雨脚・尾流雲はなめらかなまま
     let inCloud = clamp((lwc * mL + iwc * mI) / max(pr * 0.3, 1e-6), 0.0, 1.0);
     pr *= mix(1.0, keep, inCloud);
@@ -206,7 +215,7 @@ fn shaftDeficit(o: vec3f, d: vec3f, tEnd: f32, sun: vec3f, jitter: f32) -> vec3f
     var q = p;
     if (h < C.slabBot) { q = p + sun * ((C.slabBot + 1.0 - h) / sun.z); }
     let hq = altitude(q);
-    let od = textureSampleLevel(shadowVol, smpRep, domainUvw(q, hq), 0.0).r;
+    let od = sunShadowAt(q, hq, false);
     let shadowFrac = 1.0 - exp(-od);
     if (shadowFrac <= 0.001) { continue; }
     let rKm = A.bottom_radius + h / 1000.0;

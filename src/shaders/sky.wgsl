@@ -10,6 +10,7 @@ fn preExposure() -> f32 { return 1.0 / max(expo[0], 1e-4); }
 // 雲（clouds.wgsl の出力：rgb = 散乱光（プリエクスポージャー済み）, a = 透過率）と地面の雲の影
 @group(0) @binding(11) var cloudTex: texture_2d<f32>;
 @group(0) @binding(12) var shadowVol: texture_3d<f32>;
+@group(0) @binding(20) var shadowVol2: texture_3d<f32>;
 @group(0) @binding(13) var zmap: texture_2d<f32>;
 @group(0) @binding(15) var<uniform> C: CloudU;
 @group(0) @binding(16) var smpRep: sampler;
@@ -19,8 +20,11 @@ fn cloudShadowAtGround(p: vec3f) -> f32 {
   if (C.enabled < 0.5) { return 1.0; }
   let lx = p.x * 1000.0 - C.origin.x;
   let ly = p.y * 1000.0 - C.origin.y;
-  let uvw = vec3f(lx / C.size.x, ly / C.size.y, zToW(zmap, 1.0, C.ztop, C.nz));
-  return exp(-textureSampleLevel(shadowVol, smpRep, uvw, 0.0).r);
+  let tm = tileMap(lx, ly, C.size);
+  let uvw = vec3f(tm.xy, zToW(zmap, 1.0, C.ztop, C.nz));
+  let s = textureSampleLevel(shadowVol, smpRep, uvw, 0.0);
+  let s2 = textureSampleLevel(shadowVol2, smpRep, uvw, 0.0);
+  return exp(-pickSunOd(s, s2, tm.zw));
 }
 
 // 半精度の上限を超えないよう、色相を保ったまま上限で頭打ちにする

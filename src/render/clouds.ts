@@ -37,6 +37,8 @@ export class CloudVolume {
   /** セル中心の風（領域に対する相対値）[m/s] */
   vel: GPUTexture;
   shadow: GPUTexture;
+  /** 影の続き（y 反転・xy 反転の太陽方向）。遠方タイルの反転用 */
+  shadow2: GPUTexture;
   zmap: GPUTexture;
   /** テクスチャを作り直すたびに増える（バインドグループ再作成の判定用） */
   generation = 1;
@@ -87,6 +89,7 @@ export class CloudVolume {
     this.vol = this.tex3d(1, 1, 1);
     this.vel = this.tex3d(1, 1, 1);
     this.shadow = this.tex3d(1, 1, 1);
+    this.shadow2 = this.tex3d(1, 1, 1);
     this.zmap = this.makeZmap(null);
   }
 
@@ -120,18 +123,20 @@ export class CloudVolume {
   }
 
   attach(model: CloudModel | null): void {
-    const old = [this.vol, this.vel, this.shadow, this.zmap];
+    const old = [this.vol, this.vel, this.shadow, this.shadow2, this.zmap];
     this.model = model;
     if (model) {
       const g = model.cfg.grid;
       this.grid = g;
       this.vol = this.tex3d(g.nx, g.ny, g.nz);
       this.vel = this.tex3d(g.nx, g.ny, g.nz);
-      this.shadow = this.tex3d(g.nx, g.ny, g.nz);
+      // 影（太陽方向の光学的厚さ）はなめらかな量なので水平は半分の解像度で（近くはレイマーチで直接たどる）
+      this.shadow = this.tex3d(g.nx / 2, g.ny > 1 ? g.ny / 2 : 1, g.nz);
+      this.shadow2 = this.tex3d(g.nx / 2, g.ny > 1 ? g.ny / 2 : 1, g.nz);
       this.zmap = this.makeZmap(g);
       const d = new ArrayBuffer(32);
       new Uint32Array(d, 0, 4).set([g.nx, g.ny, g.nz, model.n]);
-      new Float32Array(d, 16, 4).set([g.dx, g.dy, model.cfg.ice ? 1 : 0, 0]);
+      new Float32Array(d, 16, 4).set([g.dx, g.dy, model.cfg.ice ? 1 : 0, 2]);
       this.device.queue.writeBuffer(this.dims, 0, d);
       this.enabled = true;
     } else {
@@ -139,11 +144,14 @@ export class CloudVolume {
       this.vol = this.tex3d(1, 1, 1);
       this.vel = this.tex3d(1, 1, 1);
       this.shadow = this.tex3d(1, 1, 1);
+      this.shadow2 = this.tex3d(1, 1, 1);
       this.zmap = this.makeZmap(null);
       this.enabled = false;
     }
     this.generation++;
     this.lastSteps = -1;
+    this.lastShadowTime = -1e9;
+    this.shadowSlicesLeft = 0;
     void this.device.queue.onSubmittedWorkDone().then(() => old.forEach((t) => t.destroy()));
   }
 
@@ -174,16 +182,37 @@ export class CloudVolume {
   }
 
   private sunNow: number[] = [0, 0, 1];
-  /** 計算結果から描画用ボリュームと影を更新する（計算が進んだか、光源が 0.1° 以上動いたときだけ） */
+  private sliceBuf(i: number): GPUBuffer {
+    if (!this.sliceBufs[i]) {
+      this.sliceBufs[i] = this.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    }
+    return this.sliceBufs[i];
+  }
+  private lastShadowTime = -1e9;
+  /** 影の計算を何フレームかに分ける：残りの塊の数（0 なら計算中でない） */
+  private shadowSlicesLeft = 0;
+  private static readonly SHADOW_SLICES = 4;
+  private sliceBufs: GPUBuffer[] = [];
+  /**
+   * 計算結果から描画用ボリュームと影を更新する。
+   * ボリュームは計算が進んだときだけ。影（重い：各点から5方向に積分）は、計算時間で 20 秒ごとか、
+   * 光源が 0.5° 以上動いたときだけ作り直す（雲の形の変化に対して影は少し遅れる）。
+   */
   update(): void {
     const m = this.model;
     const g = this.grid;
     if (!m || !g) return;
     const s = this.sunNow, l = this.lastSun;
     const cosMove = s[0] * l[0] + s[1] * l[1] + s[2] * l[2];
-    if (m.steps === this.lastSteps && cosMove > Math.cos((0.1 * Math.PI) / 180)) return;
+    const doVol = m.steps !== this.lastSteps;
+    if (this.shadowSlicesLeft === 0 && (m.time - this.lastShadowTime >= 20 || m.time < this.lastShadowTime || cosMove < Math.cos((0.5 * Math.PI) / 180))) {
+      this.shadowSlicesLeft = CloudVolume.SHADOW_SLICES;
+      this.lastSun = [...s];
+      this.lastShadowTime = m.time;
+    }
+    const doShadow = this.shadowSlicesLeft > 0;
+    if (!doVol && !doShadow) return;
     this.lastSteps = m.steps;
-    this.lastSun = [...s];
     // 雲のある高さの範囲（統計から。余裕を持たせる）
     const st = m.lastStats;
     if (st) {
@@ -191,10 +220,13 @@ export class CloudVolume {
       this.slabTop = Math.min(g.ztop, (st.cloudTop ?? 1000) + 500);
       // 雨は地表まで落ちるので、降水があれば下端は地表
       if (st.maxQr > 1e-6) this.slabBot = 0;
+      // 雲も降水も無ければ雲の層は空（影の計算もすぐ終わり、0 になる）
+      if (st.cloudTop === null && st.maxQr <= 0 && st.maxQc <= 0) { this.slabBot = 0; this.slabTop = -1; }
     }
     const d = this.device;
     const enc = d.createCommandEncoder();
     const pass = enc.beginComputePass({ label: 'cloud-volume' });
+    if (doVol) {
     pass.setPipeline(this.volPipe);
     pass.setBindGroup(0, d.createBindGroup({
       layout: this.volPipe.getBindGroupLayout(0),
@@ -208,6 +240,15 @@ export class CloudVolume {
       ],
     }));
     pass.dispatchWorkgroups(Math.ceil(g.nx / 8), Math.ceil(g.ny / 8), g.nz);
+    }
+    if (doShadow) {
+    // 高さ方向に SHADOW_SLICES 個に分けて、1フレームに1つずつ
+    const slice = CloudVolume.SHADOW_SLICES - this.shadowSlicesLeft;
+    const per = Math.ceil(g.nz / CloudVolume.SHADOW_SLICES);
+    const z0 = Math.min(g.nz, slice * per), z1 = Math.min(g.nz, z0 + per);
+    this.shadowSlicesLeft--;
+    if (z1 > z0) {
+    d.queue.writeBuffer(this.sliceBuf(slice), 0, new Uint32Array([z0, 0, 0, 0]));
     pass.setPipeline(this.shadowPipe);
     pass.setBindGroup(0, d.createBindGroup({
       layout: this.shadowPipe.getBindGroupLayout(0),
@@ -219,9 +260,13 @@ export class CloudVolume {
         { binding: 4, resource: this.samplerRepeat },
         { binding: 5, resource: this.zmap.createView() },
         { binding: 6, resource: this.shadow.createView() },
+        { binding: 7, resource: this.shadow2.createView() },
+        { binding: 8, resource: { buffer: this.sliceBuf(slice) } },
       ],
     }));
-    pass.dispatchWorkgroups(Math.ceil(g.nx / 8), Math.ceil(g.ny / 8), g.nz);
+    pass.dispatchWorkgroups(Math.ceil(g.nx / 16), Math.ceil(g.ny / 16), z1 - z0);
+    }
+    }
     pass.end();
     d.queue.submit([enc.finish()]);
   }
