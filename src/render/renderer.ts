@@ -249,7 +249,9 @@ export class Renderer {
 
   /** 自動露出の状態をリセット（時刻ジャンプ時など、即座に順応させたいとき） */
   resetAdaptation(): void {
-    this.gpu.device.queue.writeBuffer(this.expoBuf, 0, new Float32Array([0, 0, 0, 0]));
+    // 0 にすると最初のフレームのプリエクスポージャーが極端（×10⁴）になり、雲が半精度の上限を超えるため、
+    // 昼間程度の値から順応し直す（[0] 順応輝度、[1] は露出パスが毎フレーム書く）
+    this.gpu.device.queue.writeBuffer(this.expoBuf, 0, new Float32Array([1000, 0.001, 1, 0]));
   }
 
   private packFrame(cam: Camera, s: RenderSettings, sc: SceneState, dtReal: number, timeSec: number, w: number, h: number): Float32Array<ArrayBuffer> {

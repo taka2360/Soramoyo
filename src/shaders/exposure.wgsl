@@ -21,7 +21,7 @@ fn csMain(@builtin(local_invocation_id) lid: vec3u, @builtin(local_invocation_in
       // 画面中央をやや重視（中央重点測光）
       let w = 1.0 - 0.5 * length(uv - 0.5);
       let lum = luminance(c);
-      if (lum == lum && lum < 1e30) { s += log(max(lum, 1e-6)) * w; } // NaN/Inf は無視
+      if (lum >= 0.0 && lum < 1e30) { s += log(max(lum, 1e-6)) * w; } // NaN/Inf は無視（NaN との比較は偽）
       wsum += w;
     }
   }
@@ -35,13 +35,15 @@ fn csMain(@builtin(local_invocation_id) lid: vec3u, @builtin(local_invocation_in
     let tgt = sh[0] / 256.0;            // log 輝度
     let prev = expo[0];
     var cur = tgt;
-    if (prev > 0.0) {
+    if (prev > 0.0 && expo[2] < 0.5) { // expo[2] = 1 はリセット直後（すぐに順応させる）
       let lp = log(prev);
       // 明るくなる方向は速く、暗くなる方向はゆっくり順応（実時間）
       let tau = select(3.0, 0.6, tgt > lp);
       cur = mix(lp, tgt, 1.0 - exp(-F.dtReal / tau));
     }
-    if (cur == cur) { expo[0] = exp(cur); } else { expo[0] = 1000.0; }
+    let ex = exp(cur);
+    if (ex > 1e-8 && ex < 1e12) { expo[0] = ex; } else { expo[0] = 1000.0; }
+    expo[2] = 0.0;
     expo[1] = pre;  // トーンマップがこのフレームの HDR を絶対輝度に戻すのに使う
   }
 }

@@ -12,6 +12,9 @@ export interface CloudSettings {
   detail: number;
   /** 雲を描く最大距離 [km] */
   maxDistKm: number;
+  /** レイマーチの刻み：距離に対する比（小さいほど細かく重い）と最小刻み [m] */
+  stepScale: number;
+  minStepM: number;
 }
 
 /**
@@ -145,7 +148,7 @@ export class CloudVolume {
     this.frameNo = (this.frameNo + 1) % 1024;
     c.set([sunDir[0], sunDir[1], sunDir[2], this.frameNo], 12);
     c.set([period, dUm, groundAlbedo, this.enabled ? 1 : 0], 16);
-    c.set([histAlpha, g ? g.dx : 100, 0, 0], 20);
+    c.set([histAlpha, g ? g.dx : 100, s.stepScale, s.minStepM], 20);
     this.device.queue.writeBuffer(this.uniform, 0, c);
   }
 

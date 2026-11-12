@@ -102,8 +102,8 @@ fn sampleMedium(p: vec3f, h: f32, withShadow: bool) -> Medium {
     lwc *= keep;
     iwc *= keep;
   }
-  let sI = sigmaIce(iwc * 1e-3);
-  m.sigma = sigmaCloud(lwc * 1e-3, C.nDrop) + sI + sigmaRain(v.b * 1e-3);
+  let sI = sigmaIce(iwc * 1e-3) * iceMask(iwc);
+  m.sigma = sigmaCloud(lwc * 1e-3, C.nDrop) * cloudMask(lwc) + sI + sigmaRain(v.b * 1e-3);
   m.iceFrac = select(0.0, sI / m.sigma, m.sigma > 0.0);
   if (withShadow && m.sigma > 0.0) {
     m.odUp = textureSampleLevel(shadowVol, smpRep, uvw, 0.0).g;
@@ -160,8 +160,13 @@ fn ignNoise(p: vec2f) -> f32 {
 fn fsMain(in: VsOut) -> @location(0) vec4f {
   var cur = march(in);
   if (any(cur != cur)) { cur = vec4f(0.0, 0.0, 0.0, 1.0); }
+  // 半精度の上限（65504）を超えると Inf になり、合成で NaN になる。色相を保ったまま頭打ちにする
+  let mx = max(abs(cur.r), max(abs(cur.g), abs(cur.b)));
+  if (!(mx < 30000.0)) { cur = vec4f(select(vec3f(0.0), cur.rgb * (30000.0 / mx), mx < 3.0e38), cur.a); }
   // 時間方向の蓄積（簡易 TAA。カメラが動いたフレームは histAlpha=1 で履歴を捨てる）
-  let prev = textureLoad(history, vec2i(in.pos.xy), 0);
+  var prev = textureLoad(history, vec2i(in.pos.xy), 0);
+  // 履歴に一度でも NaN/Inf が入ると残り続ける（NaN×0 も NaN）ので、その画素は今回の値で置き換える
+  if (any(prev != prev) || any(abs(prev) > vec4f(1e30)) || C.histAlpha >= 1.0) { return cur; }
   return mix(prev, cur, C.histAlpha);
 }
 
@@ -214,15 +219,29 @@ fn march(in: VsOut) -> vec4f {
   var wsum = 0.0;
   var t = t0;
   let jitter = ignNoise(in.pos.xy + C.frame * vec2f(5.588238, 3.1416));
-  var ds = max(40.0, t * 0.015);
+  // 刻みの方針：雲の無い所は粗く（基本刻みの2倍）進み、雲に当たったら1歩戻って細かく（基本の 0.35 倍）進む。
+  // 一定の刻みのままだと、薄い雲頂の面と刻みが干渉して縞模様（エイリアシング）が出るため。
+  var ds = 2.0 * max(C.minStep, t * C.stepScale);
   t += ds * jitter;
-  for (var i = 0; i < 220; i++) {
+  var inCloud = false;
+  var emptyRun = 0;
+  for (var i = 0; i < 320; i++) {
     if (t >= t1 || T < 0.01) { break; }
     let p = o + d * t;
     let h = altitude(p);
     var m = sampleMedium(p, h, true);
-    ds = max(40.0, t * 0.015);
+    let base = max(C.minStep, t * C.stepScale);
+    if (m.sigma > 1e-7 && !inCloud) {
+      // 粗い刻みで雲に入った：1歩戻って細かい刻みでやり直す（ジッターで戻り幅もばらつかせる）
+      inCloud = true;
+      emptyRun = 0;
+      t = max(t - ds * (0.5 + 0.5 * jitter), t0);
+      ds = 0.35 * base;
+      continue;
+    }
     if (m.sigma > 1e-7) {
+      emptyRun = 0;
+      ds = 0.35 * base;
       m.odSun = sunOpticalDepth(p, sun);
       // 点での太陽光（大気の透過込み）と空からの光
       let rKm = A.bottom_radius + h / 1000.0;
@@ -252,7 +271,10 @@ fn march(in: VsOut) -> vec4f {
       wsum += wgt;
       T *= Tseg;
     } else {
-      ds *= 1.6; // 空いている所は大きく進む
+      // 雲を抜けたら、しばらく細かいまま進んでから粗い刻みに戻る
+      emptyRun++;
+      if (emptyRun > 7) { inCloud = false; } // 戻った距離（粗い刻み1歩 ≤ 基本の2倍）より長く細かく進んでから戻す
+      ds = select(2.0 * base, 0.35 * base, inCloud);
     }
     t += ds;
   }

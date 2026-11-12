@@ -6,7 +6,7 @@ struct CloudU {
   nDrop: f32, detail: f32, time: f32, maxDist: f32,  // 雲粒数濃度 [1/m³]、細部合成の強さ
   sunDir: vec3f, frame: f32,
   noisePeriod: f32, dropDiamUm: f32, groundAlbedo: f32, enabled: f32,
-  histAlpha: f32, cellSize: f32, pad1: f32, pad2: f32,   // 時間方向の蓄積の混合率、水平格子幅 [m]
+  histAlpha: f32, cellSize: f32, stepScale: f32, minStep: f32,   // 時間方向の蓄積の混合率、水平格子幅 [m]、レイマーチの刻み（距離比・最小 [m]）
 };
 
 // 雲水量 [kg/m³] → 消散係数 [1/m]。有効半径は雲粒数濃度から：
@@ -21,8 +21,13 @@ fn sigmaRain(rwcKg: f32) -> f32 { return 3.0 * max(rwcKg, 0.0); }
 // 雲氷：有効半径 30 µm の氷晶と仮定（σ = 1.5 IWC/(ρi r_eff), ρi = 917 kg/m³）
 fn sigmaIce(iwcKg: f32) -> f32 { return 54.5 * max(iwcKg, 0.0); }
 // 描画用ボリューム：r = 雲水 [g/m³]、g = 雲氷 [g/m³]、b = 降水（雨換算の量。雪は見通しを悪くするので 5 倍）、a = 渦粘性
+// ごく薄い値（移流の数値拡散で雲の外ににじみ出た分）は晴れとみなす。
+// σ ∝ LWC^(2/3) なので、0.0001 g/m³ 程度でも数十 km の視線では霧のように効いてしまうため。
+// （本物の雲の縁は鋭い。閾値は雲水 0.0005〜0.005 g/m³、雲氷 0.0001〜0.001 g/m³ でなめらかに）
+fn cloudMask(lwcG: f32) -> f32 { return smoothstep(5e-4, 5e-3, lwcG); }
+fn iceMask(iwcG: f32) -> f32 { return smoothstep(1e-4, 1e-3, iwcG); }
 fn sigmaVolume(v: vec4f, nDrop: f32) -> f32 {
-  return sigmaCloud(v.r * 1e-3, nDrop) + sigmaIce(v.g * 1e-3) + sigmaRain(v.b * 1e-3);
+  return sigmaCloud(v.r * 1e-3, nDrop) * cloudMask(v.r) + sigmaIce(v.g * 1e-3) * iceMask(v.g) + sigmaRain(v.b * 1e-3);
 }
 
 // 高さ z [m] → 3D テクスチャの w 座標（不等間隔の鉛直格子に対応する対応表を引く）

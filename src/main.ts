@@ -23,7 +23,7 @@ async function main(): Promise<void> {
   cam.attach(canvas);
 
   const rs: RenderSettings = { exposureEV: 0, autoExposure: true, grid: false, renderScale: 1, cloudScale: 0.5, whiteBalance: true };
-  const cs: CloudSettings = { dropletsPerCc: 300, detail: 0.6, maxDistKm: 120 };
+  const cs: CloudSettings = { dropletsPerCc: 300, detail: 0.6, maxDistKm: 120, stepScale: 0.015, minStepM: 40 };
   const atmoSettings = { ...DEFAULT_ATMOSPHERE };
   const lutOpt: PrecomputeOptions = { wavelengthGroups: 8, scatteringOrders: 6 };
 
