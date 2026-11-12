@@ -127,7 +127,7 @@ fn shaftDeficit(o: vec3f, d: vec3f, tEnd: f32, sun: vec3f, jitter: f32) -> vec3f
     if (shadowFrac <= 0.001) { continue; }
     let rKm = A.bottom_radius + h / 1000.0;
     let up = normalize(p - vec3f(0.0, 0.0, -EARTH_R_M));
-    let sunE = F.sunIllum * getTransmittanceToSun(rKm, dot(up, sun));
+    let sunE = F.lightIllum * getTransmittanceToSun(rKm, dot(up, sun));
     let hk = h / 1000.0;
     let scat = A.rayleigh_scattering * exp(-hk / 8.0) * pr + A.mie_scattering * exp(-hk / A.mie_scale_height) * pm; // [1/km]
     let tv = getTransmittance(camR, d.z, t / 1000.0, rayIntersectsGround(camR, d.z));
@@ -179,7 +179,8 @@ fn march(in: VsOut) -> vec4f {
   t1 = min(t1, t0 + C.maxDist);
   if (!(t1 > t0)) { return vec4f(0.0, 0.0, 0.0, 1.0); }
 
-  let sun = F.sunDir;
+  // 主光源（昼は太陽、太陽が地平線下 6° より低い夜は月）
+  let sun = F.lightDir;
   let cosT = dot(d, sun);
   let dropD = C.dropDiamUm;
   // 多重散乱のオクターブ近似（Wrenninge 2013）
@@ -208,8 +209,8 @@ fn march(in: VsOut) -> vec4f {
       let rKm = A.bottom_radius + h / 1000.0;
       let up = normalize(p - vec3f(0.0, 0.0, -EARTH_R_M));
       let muS = dot(up, sun);
-      let sunE = F.sunIllum * getTransmittanceToSun(rKm, muS);
-      let skyE = getIrradiance(rKm, muS);
+      let sunE = F.lightIllum * getTransmittanceToSun(rKm, muS);
+      let skyE = getIrradiance(rKm, muS) * F.lightScale;
       var S = vec3f(0.0);
       var a = 1.0; var b = 1.0;
       for (var oc = 0; oc < 4; oc++) {
@@ -217,8 +218,12 @@ fn march(in: VsOut) -> vec4f {
         a *= 0.5; b *= 0.5;
       }
       // 環境光：上半球は空、下半球は地面の照り返し（雲による遮りを上下の光学的厚さで近似）
-      let groundE = (skyE + F.sunIllum * getTransmittanceToSun(A.bottom_radius, muS) * max(muS, 0.0)) * C.groundAlbedo;
-      let amb = (skyE * exp(-0.25 * m.odUp) * 0.5 + groundE * 0.5 * 0.6) / PI;
+      let groundE = (skyE + F.lightIllum * getTransmittanceToSun(A.bottom_radius, muS) * max(muS, 0.0)) * C.groundAlbedo;
+      // 夜は大気光・星明かり（上から）と光害（地上の照明。下から雲底を照らす）も効く
+      let nightUp = (F.nightGlow + 4.0e-5) * vec3f(0.9, 1.0, 0.75);
+      let cityUp = F.lpZenith * 4.0 * vec3f(1.0, 0.82, 0.6) / 0.86;
+      let amb = (skyE * exp(-0.25 * m.odUp) * 0.5 + groundE * 0.5 * 0.6) / PI
+              + nightUp * exp(-0.25 * m.odUp) * 0.5 + cityUp * 0.5;
       let src = S + amb;
       let Tseg = exp(-m.sigma * ds);
       // 区間内の積分（Hillaire 2016 のエネルギー保存形、散乱アルベド≈1）

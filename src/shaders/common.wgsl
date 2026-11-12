@@ -10,6 +10,15 @@ struct Frame {
   sunIllum: vec3f, gridOn: f32,      // 大気上端の太陽照度（線形 sRGB, lx）
   whitePoint: vec3f, time: f32,      // 白色点（太陽光を白とみなす色順応）
   resolution: vec2f, groundAlbedo: f32, refractionScale: f32,
+  moonDir: vec3f, moonAngRadius: f32,      // 月の真の方向（地表から見た方向）
+  moonDirApp: vec3f, moonLumScale: f32,    // 月の見かけの方向、月面輝度の係数（Lommel–Seeliger の正規化込み）
+  moonIllum: vec3f, earthshine: f32,       // 大気上端での月の照度（線形 sRGB, lx）、地球照の輝度 [cd/m²]
+  lightDir: vec3f, lightScale: f32,        // 雲を照らす主光源（昼は太陽、夜は月）と、太陽に対する明るさの比
+  lightIllum: vec3f, lpZenith: f32,        // 主光源の照度、光害による天頂輝度 [cd/m²]
+  eqX: vec3f, nightGlow: f32,              // J2000 → ENU 行列の行0、大気光の天頂輝度 [cd/m²]
+  eqY: vec3f, scotopic: f32,               // 行1、暗所視の表現（0/1）
+  eqZ: vec3f, mwScale: f32,                // 行2、天の川の明るさの倍率
+  pad8: vec4f,
 };
 
 struct VsOut {

@@ -10,6 +10,7 @@ import { computeEphemeris } from './astro/scene';
 import { CloudVolume, type CloudSettings } from './render/clouds';
 import { SimManager, SCENARIOS } from './sim/manager';
 import { SkewT } from './ui/skewt';
+import { loadMilkyWayTexture, loadStars } from './render/nightsky';
 
 async function main(): Promise<void> {
   const canvas = document.getElementById('sky') as HTMLCanvasElement;
@@ -29,6 +30,19 @@ async function main(): Promise<void> {
   const atmo = new AtmosphereLut(gpu.device, gpu.hasFloat32Filterable);
   const cloudVol = new CloudVolume(gpu.device);
   const renderer = new Renderer(gpu, canvas, atmo, cloudVol);
+  // 夜空のデータ（非同期に読み込む）
+  Promise.all([loadMilkyWayTexture(gpu.device), loadStars(gpu.device)])
+    .then(([mw, st]) => renderer.setNightSky(mw, st))
+    .catch((e) => console.error('[Soramoyo] 夜空データの読み込みに失敗', e));
+  // 夜空の設定
+  const night = {
+    /** 天頂の空の明るさ [mag/arcsec²]。22 = 光害なし、21 = 郊外、19 = 住宅地、17 = 都心 */
+    skyMag: 22,
+    nightGlow: 1.2e-4,
+    milkyWay: 1,
+    scotopic: true,
+  };
+  const lpZenith = () => Math.max(0, 1.08e5 * Math.pow(10, -0.4 * night.skyMag) - 1.7e-4);
   const sim = new SimManager(gpu.device);
   sim.loadFor(sim.scenario, obs.latDeg, clock.utcMs, obs.utcOffsetHours);
   cloudVol.attach(sim.model);
@@ -75,6 +89,12 @@ async function main(): Promise<void> {
   fs.add(cs, 'dropletsPerCc', 30, 1500, 10).name('雲粒の数 [個/cm³]');
   fs.add(cs, 'detail', 0, 2, 0.05).name('細部合成の強さ');
   fs.add(cs, 'maxDistKm', 10, 200, 5).name('雲を描く距離 [km]');
+  const fn = panel.gui.addFolder('夜空');
+  fn.add(night, 'skyMag', 16, 22, 0.1).name('天頂の明るさ [等/秒角²]（22=光害なし）');
+  fn.add(night, 'nightGlow', 0, 4e-4, 1e-5).name('大気光 [cd/m²]');
+  fn.add(night, 'milkyWay', 0, 3, 0.05).name('天の川の明るさ（倍）');
+  fn.add(night, 'scotopic').name('暗所視（夜の色の見え方）');
+  fn.close();
   const skewT = new SkewT(document.body);
   const skewUi = { show: false };
   fs.add(skewUi, 'show').name('Skew-T 図を表示').onChange((v: boolean) => skewT.setVisible(v));
@@ -129,12 +149,16 @@ async function main(): Promise<void> {
     const camKey = `${cam.azimuth.toFixed(5)},${cam.altitude.toFixed(5)},${cam.fovY.toFixed(5)},${cam.heightM.toFixed(2)},${canvas.clientWidth}x${canvas.clientHeight},${rs.renderScale},${rs.cloudScale}`;
     const histAlpha = camKey === lastCamKey ? 0.15 : 1;
     lastCamKey = camKey;
-    cloudVol.writeUniform(sim.origin, eph.sunDir, sim.model?.time ?? 0, cs, atmoSettings.groundAlbedo, histAlpha);
+    const lightDir = eph.sunDir[2] < -0.1 ? eph.moonDir : eph.sunDir; // 雲の影を作る主光源（renderer と同じ判定）
+    cloudVol.writeUniform(sim.origin, lightDir, sim.model?.time ?? 0, cs, atmoSettings.groundAlbedo, histAlpha);
     if (sim.model && !sim.busy) cloudVol.update();
     renderer.render(
       cam,
       rs,
-      { ...eph, groundElevationM: obs.elevationM, groundAlbedo: atmoSettings.groundAlbedo },
+      {
+        ...eph, groundElevationM: obs.elevationM, groundAlbedo: atmoSettings.groundAlbedo,
+        lightPollution: lpZenith(), nightGlow: night.nightGlow, milkyWayScale: night.milkyWay, scotopic: night.scotopic,
+      },
       dtReal,
       now / 1000,
     );
@@ -151,7 +175,8 @@ async function main(): Promise<void> {
       hud.textContent =
         `${obs.name}  ${clock.localDateString(obs)} ${clock.localTimeString(obs)} (UTC${obs.utcOffsetHours >= 0 ? '+' : ''}${obs.utcOffsetHours})` +
         `  再生 ×${clock.effectiveSpeed}\n` +
-        `太陽 高度 ${sunAlt.toFixed(2)}°（大気差込み） 方位 ${sunAz.toFixed(2)}°\n` +
+        `太陽 高度 ${sunAlt.toFixed(2)}°（大気差込み） 方位 ${sunAz.toFixed(2)}°   ` +
+        `月 高度 ${(Math.asin(eph.moonDirApparent[2]) * deg).toFixed(2)}° 方位 ${(((Math.atan2(eph.moonDir[0], eph.moonDir[1]) * deg) + 360) % 360).toFixed(2)}° 輝面比 ${(eph.moonIlluminatedFraction * 100).toFixed(0)}%\n` +
         `視線 方位 ${(cam.azimuth * deg).toFixed(1)}°  高度 ${(cam.altitude * deg).toFixed(1)}°  画角 ${(cam.fovY * deg).toFixed(1)}°  視点 ${cam.heightM.toFixed(0)} m\n` +
         `${w}×${h}  ${fps.toFixed(0)} fps` +
         (renderer.timer.enabled ? `  GPU[ms] ${gpuMs}` : '  (GPU 計測なし)') +

@@ -10,11 +10,13 @@ import cloudsWgsl from '../shaders/clouds/clouds.wgsl?raw';
 import skyWgsl from '../shaders/sky.wgsl?raw';
 import exposureWgsl from '../shaders/exposure.wgsl?raw';
 import tonemapWgsl from '../shaders/tonemap.wgsl?raw';
+import starsWgsl from '../shaders/stars.wgsl?raw';
+import type { StarData } from './nightsky';
 import { GpuTimer } from './gpuTimer';
 import type { CloudVolume } from './clouds';
 
 export const HDR_FORMAT: GPUTextureFormat = 'rgba16float';
-const FRAME_FLOATS = 40;
+const FRAME_FLOATS = 72;
 
 export interface RenderSettings {
   /** 露出補正 [EV] */
@@ -41,6 +43,19 @@ export interface SceneState {
   whitePoint: number[];
   groundAlbedo: number;
   refractionScale: number;
+  moonDir: number[];
+  moonDirApparent: number[];
+  moonAngularRadius: number;
+  moonIlluminance: number[];
+  moonLuminanceScale: number;
+  earthshine: number;
+  j2000ToEnu: number[];
+  /** 光害による天頂の輝度 [cd/m²]（0 = 光害なし） */
+  lightPollution: number;
+  /** 大気光（夜光）の天頂輝度 [cd/m²] */
+  nightGlow: number;
+  milkyWayScale: number;
+  scotopic: boolean;
 }
 
 /**
@@ -56,6 +71,11 @@ export class Renderer {
   private cloudPipe: GPURenderPipeline;
   private expoPipe: GPUComputePipeline;
   private tonePipe: GPURenderPipeline;
+  private starPipe: GPURenderPipeline;
+  private starBind: GPUBindGroup[] = [];
+  private stars: StarData | null = null;
+  private mwTex: GPUTexture;
+  private nightGen = 0;
   private skyBind: GPUBindGroup[] = [];
   private cloudBind: GPUBindGroup[] = [];
   private parity = 0;
@@ -91,10 +111,22 @@ export class Renderer {
     this.skyPipe = fs('sky', atmoBase + skyWgsl, HDR_FORMAT);
     this.cloudPipe = fs('clouds', atmoBase + cloudsWgsl, HDR_FORMAT);
     this.tonePipe = fs('tonemap', commonWgsl + tonemapWgsl, gpu.canvasFormat);
+    const starMod = device.createShaderModule({ label: 'stars', code: atmoFunctionsWgsl + commonWgsl + starsWgsl });
+    this.starPipe = device.createRenderPipeline({
+      label: 'stars',
+      layout: 'auto',
+      vertex: { module: starMod, entryPoint: 'vsStar' },
+      fragment: {
+        module: starMod, entryPoint: 'fsStar',
+        targets: [{ format: HDR_FORMAT, blend: { color: { srcFactor: 'one', dstFactor: 'one' }, alpha: { srcFactor: 'zero', dstFactor: 'one' } } }],
+      },
+      primitive: { topology: 'triangle-list' },
+    });
+    this.mwTex = device.createTexture({ size: [1, 1], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING });
     const expoMod = device.createShaderModule({ label: 'exposure', code: commonWgsl + exposureWgsl });
     this.expoPipe = device.createComputePipeline({ label: 'exposure', layout: 'auto', compute: { module: expoMod, entryPoint: 'csMain' } });
 
-    this.timer = new GpuTimer(device, gpu.hasTimestamps, ['clouds', 'sky', 'exposure', 'tonemap']);
+    this.timer = new GpuTimer(device, gpu.hasTimestamps, ['clouds', 'sky', 'stars', 'exposure', 'tonemap']);
   }
 
   private resize(scale: number, cloudScale: number): void {
@@ -141,11 +173,19 @@ export class Renderer {
     this.bindKey = '';
   }
 
+  /** 夜空のデータ（天の川テクスチャ・恒星）を設定 */
+  setNightSky(mw: GPUTexture, stars: StarData): void {
+    this.mwTex = mw;
+    this.stars = stars;
+    this.nightGen++;
+    this.bindKey = '';
+  }
+
   private ensureBinds(): boolean {
     const a = this.atmo;
     const c = this.clouds;
     if (a.generation === 0) return false;
-    const key = `${a.generation}/${c.generation}/${this.width}x${this.height}/${this.cw}`;
+    const key = `${a.generation}/${c.generation}/${this.width}x${this.height}/${this.cw}/${this.nightGen}`;
     if (key === this.bindKey) return true;
     const atmoEntries = (frame: GPUBuffer): GPUBindGroupEntry[] => [
       { binding: 0, resource: { buffer: a.uniform } },
@@ -168,8 +208,24 @@ export class Renderer {
         { binding: 13, resource: c.zmap.createView() },
         { binding: 15, resource: { buffer: c.uniform } },
         { binding: 16, resource: c.samplerRepeat },
+        { binding: 17, resource: this.mwTex.createView() },
       ],
     }));
+    if (this.stars) {
+      const st = this.stars;
+      this.starBind = [0, 1].map((p) => d.createBindGroup({
+        layout: this.starPipe.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: a.uniform } },
+          { binding: 1, resource: a.sampler },
+          { binding: 2, resource: a.transmittance.createView() },
+          { binding: 9, resource: { buffer: this.frameBuf } },
+          { binding: 10, resource: { buffer: this.expoBuf } },
+          { binding: 11, resource: this.cloudTargets[p].createView() },
+          { binding: 20, resource: { buffer: st.buffer } },
+        ],
+      }));
+    }
     this.cloudBind = [0, 1].map((p) => d.createBindGroup({
       layout: this.cloudPipe.getBindGroupLayout(0),
       entries: [
@@ -210,6 +266,20 @@ export class Renderer {
     f.set([...sc.sunIlluminance, s.grid ? 1 : 0], 24);
     f.set([...wp, timeSec % 3600], 28);
     f.set([w, h, sc.groundAlbedo, sc.refractionScale], 32);
+    f.set([...sc.moonDir, sc.moonAngularRadius], 36);
+    f.set([...sc.moonDirApparent, sc.moonLuminanceScale], 40);
+    f.set([...sc.moonIlluminance, sc.earthshine], 44);
+    // 雲を照らす主光源：太陽が地平線下 6° より低ければ月
+    const Y = (c: number[]) => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    const useMoon = sc.sunDir[2] < -0.1;
+    const lDir = useMoon ? sc.moonDir : sc.sunDir;
+    const lIll = useMoon ? sc.moonIlluminance : sc.sunIlluminance;
+    f.set([...lDir, Y(lIll) / Y(sc.sunIlluminance)], 48);
+    f.set([...lIll, sc.lightPollution], 52);
+    const m = sc.j2000ToEnu;
+    f.set([m[0], m[1], m[2], sc.nightGlow], 56);
+    f.set([m[3], m[4], m[5], sc.scotopic ? 1 : 0], 60);
+    f.set([m[6], m[7], m[8], sc.milkyWayScale], 64);
     return f;
   }
 
@@ -236,6 +306,16 @@ export class Renderer {
     const p = this.parity;
     fullscreen(this.cloudTargets[p].createView(), this.cloudPipe, this.cloudBind[p], 'clouds', [0, 0, 0, 1]);
     fullscreen(this.hdr.createView(), this.skyPipe, this.skyBind[p], 'sky', [0, 0, 0, 1]);
+    if (this.stars && this.starBind.length) {
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{ view: this.hdr.createView(), loadOp: 'load', storeOp: 'store' }],
+        timestampWrites: this.timer.writes('stars'),
+      });
+      pass.setPipeline(this.starPipe);
+      pass.setBindGroup(0, this.starBind[p]);
+      pass.draw(6, this.stars.count);
+      pass.end();
+    }
     {
       const pass = enc.beginComputePass({ timestampWrites: this.timer.computeWrites('exposure') });
       pass.setPipeline(this.expoPipe);

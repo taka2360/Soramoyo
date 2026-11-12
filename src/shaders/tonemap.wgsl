@@ -44,18 +44,29 @@ fn fsMain(in: VsOut) -> @location(0) vec4f {
   let p = vec2i(in.pos.xy);
   let hdr = textureLoad(hdrTex, p, 0).rgb / (F.whitePoint * max(expo[1], 1e-12));
   var exposure: f32;
+  // 順応輝度：暗順応の限界として下限を設ける（月のない暗い夜空 ~2×10⁻⁴ cd/m² 程度）
+  let La = max(expo[0], 3.0e-4);
+  let logLa = log(La) / log(10.0);
   if (F.autoExposure > 0.5) {
-    // 順応輝度に下限を設け、暗い場面は暗く見えるようにする。
-    // キー値は Krawczyk 2005：暗い場面ほど小さい（＝暗く表示）
-    let La = max(expo[0], 0.02);
+    // 暗い場面ほど暗く表示する（キー値が小さい）。昼は Krawczyk 2005 の式、
+    // 夜はそれだと真っ黒になるので、暗順応した目で天の川が見える程度まで下限を持たせる。
     // 0.2 倍は ACES 曲線と組み合わせたときの見た目の調整（晴天の天頂が濃い青に見える程度）
-    let key = 0.2 * (1.03 - 2.0 / (2.0 + log(La + 1.0) / log(10.0)));
+    let kDay = 1.03 - 2.0 / (2.0 + log(La + 1.0) / log(10.0));
+    let key = 0.2 * max(kDay, 0.12 + 0.2 * smoothstep(-3.5, 0.5, logLa));
     exposure = key / La;
   } else {
     exposure = 1.0e-4; // 固定：EV 0 で晴天の空がほどよく見える程度
   }
   exposure *= exp2(F.exposureEV);
-  let mapped = toneMap(hdr * exposure);
+  var c = hdr * exposure;
+  // 暗所視（プルキンエ現象）：暗いと桿体が働き、色が薄れて青みがかって見える。
+  // 順応輝度 3 cd/m² 以下で始まり 0.003 cd/m² 以下でほぼ桿体だけになる（薄明視の簡易な混合）
+  if (F.scotopic > 0.5) {
+    let rod = 1.0 - smoothstep(-2.5, 0.5, logLa);
+    let vs = dot(c, vec3f(0.062, 0.608, 0.330)); // 桿体の感度（507 nm 付近がピーク）を sRGB の重みで近似
+    c = mix(c, vs * vec3f(0.78, 0.92, 1.3), rod * 0.85);
+  }
+  let mapped = toneMap(c);
   var s = linearToSrgb(mapped);
   s += (ign(in.pos.xy) - 0.5) / 255.0;
   return vec4f(s, 1.0);
