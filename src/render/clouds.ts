@@ -15,6 +15,12 @@ export interface CloudSettings {
   /** レイマーチの刻み：距離に対する比（小さいほど細かく重い）と最小刻み [m] */
   stepScale: number;
   minStepM: number;
+  /** レイマーチの最大ステップ数 */
+  maxSteps: number;
+  /** 薄明光線（雲の影）の視線上のサンプル数 */
+  shaftSamples: number;
+  /** 細部合成の細かい段（近くの 25〜90 m の凹凸）を使うか */
+  detailHQ: boolean;
 }
 
 /**
@@ -24,8 +30,12 @@ export interface CloudSettings {
 export class CloudVolume {
   readonly uniform: GPUBuffer;
   readonly samplerRepeat: GPUSampler;
+  /** ノイズ用（3方向とも繰り返し） */
+  readonly samplerNoise: GPUSampler;
   noise: GPUTexture;
   vol: GPUTexture;
+  /** セル中心の風（領域に対する相対値）[m/s] */
+  vel: GPUTexture;
   shadow: GPUTexture;
   zmap: GPUTexture;
   /** テクスチャを作り直すたびに増える（バインドグループ再作成の判定用） */
@@ -37,16 +47,19 @@ export class CloudVolume {
   private shadowPipe: GPUComputePipeline;
   private model: CloudModel | null = null;
   private grid: Grid | null = null;
-  private cdata = new Float32Array(24);
+  private cdata = new Float32Array(28);
   slabBot = 0;
   slabTop = 3000;
 
   constructor(private device: GPUDevice) {
-    this.uniform = device.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.uniform = device.createBuffer({ size: 112, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.dims = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.samplerRepeat = device.createSampler({
       magFilter: 'linear', minFilter: 'linear',
       addressModeU: 'repeat', addressModeV: 'repeat', addressModeW: 'clamp-to-edge',
+    });
+    this.samplerNoise = device.createSampler({
+      magFilter: 'linear', minFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat', addressModeW: 'repeat',
     });
     const mod = (label: string, code: string) => device.createShaderModule({ label, code });
     this.volPipe = device.createComputePipeline({
@@ -72,6 +85,7 @@ export class CloudVolume {
 
     // モデルが無いときのダミー
     this.vol = this.tex3d(1, 1, 1);
+    this.vel = this.tex3d(1, 1, 1);
     this.shadow = this.tex3d(1, 1, 1);
     this.zmap = this.makeZmap(null);
   }
@@ -106,12 +120,13 @@ export class CloudVolume {
   }
 
   attach(model: CloudModel | null): void {
-    const old = [this.vol, this.shadow, this.zmap];
+    const old = [this.vol, this.vel, this.shadow, this.zmap];
     this.model = model;
     if (model) {
       const g = model.cfg.grid;
       this.grid = g;
       this.vol = this.tex3d(g.nx, g.ny, g.nz);
+      this.vel = this.tex3d(g.nx, g.ny, g.nz);
       this.shadow = this.tex3d(g.nx, g.ny, g.nz);
       this.zmap = this.makeZmap(g);
       const d = new ArrayBuffer(32);
@@ -122,16 +137,20 @@ export class CloudVolume {
     } else {
       this.grid = null;
       this.vol = this.tex3d(1, 1, 1);
+      this.vel = this.tex3d(1, 1, 1);
       this.shadow = this.tex3d(1, 1, 1);
       this.zmap = this.makeZmap(null);
       this.enabled = false;
     }
     this.generation++;
+    this.lastSteps = -1;
     void this.device.queue.onSubmittedWorkDone().then(() => old.forEach((t) => t.destroy()));
   }
 
   /** 毎フレームの定数（領域の位置、太陽方向など） */
   private frameNo = 0;
+  private lastSun = [0, 0, 0];
+  private lastSteps = -1;
   writeUniform(origin: [number, number], sunDir: number[], time: number, s: CloudSettings, groundAlbedo: number, histAlpha: number): void {
     const g = this.grid;
     const c = this.cdata;
@@ -146,17 +165,25 @@ export class CloudVolume {
     c.set([g ? g.ztop : 1, this.slabBot, this.slabTop, g ? g.nz : 1], 4);
     c.set([n, s.detail, time, s.maxDistKm * 1000], 8);
     this.frameNo = (this.frameNo + 1) % 1024;
+    this.sunNow = sunDir;
     c.set([sunDir[0], sunDir[1], sunDir[2], this.frameNo], 12);
     c.set([period, dUm, groundAlbedo, this.enabled ? 1 : 0], 16);
     c.set([histAlpha, g ? g.dx : 100, s.stepScale, s.minStepM], 20);
+    c.set([s.shaftSamples, s.detailHQ ? 1 : 0, s.maxSteps, 0], 24);
     this.device.queue.writeBuffer(this.uniform, 0, c);
   }
 
-  /** 計算結果から描画用ボリュームと影を更新する */
+  private sunNow: number[] = [0, 0, 1];
+  /** 計算結果から描画用ボリュームと影を更新する（計算が進んだか、光源が 0.1° 以上動いたときだけ） */
   update(): void {
     const m = this.model;
     const g = this.grid;
     if (!m || !g) return;
+    const s = this.sunNow, l = this.lastSun;
+    const cosMove = s[0] * l[0] + s[1] * l[1] + s[2] * l[2];
+    if (m.steps === this.lastSteps && cosMove > Math.cos((0.1 * Math.PI) / 180)) return;
+    this.lastSteps = m.steps;
+    this.lastSun = [...s];
     // 雲のある高さの範囲（統計から。余裕を持たせる）
     const st = m.lastStats;
     if (st) {
@@ -177,6 +204,7 @@ export class CloudVolume {
         { binding: 2, resource: { buffer: m.columnBuffer } },
         { binding: 3, resource: { buffer: m.diagBuffer } },
         { binding: 4, resource: this.vol.createView() },
+        { binding: 5, resource: this.vel.createView() },
       ],
     }));
     pass.dispatchWorkgroups(Math.ceil(g.nx / 8), Math.ceil(g.ny / 8), g.nz);

@@ -20,6 +20,8 @@ struct Col {
 @group(0) @binding(2) var<storage, read> col: array<Col>;
 @group(0) @binding(3) var<storage, read> diag: array<f32>;
 @group(0) @binding(4) var volOut: texture_storage_3d<rgba16float, write>;
+// セル中心の風（計算領域に対する相対値）[m/s]。細部合成を流れに乗せるため
+@group(0) @binding(5) var velOut: texture_storage_3d<rgba16float, write>;
 
 // 温度による相の分け方（モデルの micro.wgsl と同じ）
 fn liqFracCloud(T: f32) -> f32 { return clamp((T - 253.16) / 20.0, 0.0, 1.0); }
@@ -41,5 +43,14 @@ fn csToVolume(@builtin(global_invocation_id) g: vec3u) {
   }
   let nu = diag[id];
   let k = rho * 1000.0;
+  // セル中心の風（U は x 面 i−1/2、V は y 面 j−1/2、W は下面 k−1/2 にある。水平は周期境界）
+  let ip = ((g.x + 1u) % D.nx) + D.nx * (g.y + D.ny * g.z);
+  let jp = g.x + D.nx * (((g.y + 1u) % D.ny) + D.ny * g.z);
+  let u = 0.5 * (st[id] + st[ip]);
+  let v = 0.5 * (st[D.n + id] + st[D.n + jp]);
+  var wTop = 0.0;
+  if (g.z + 1u < D.nz) { wTop = st[2u * D.n + id + D.nx * D.ny]; }
+  let w = 0.5 * (st[2u * D.n + id] + wTop);
+  textureStore(velOut, g, vec4f(u, v, w, 0.0));
   textureStore(volOut, g, vec4f(qn * wn * k, qn * (1.0 - wn) * k, (qp * (wp + 5.0 * (1.0 - wp)) + qg) * k, nu));
 }

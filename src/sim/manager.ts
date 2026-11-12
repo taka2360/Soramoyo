@@ -34,6 +34,13 @@ export class SimManager {
   scenario = Object.keys(SCENARIOS)[0];
   running = true;
   maxStepsPerFrame = 3;
+  /** 1フレームに雲の計算へ割く GPU 時間の目安 [ms]（1ステップを塊に分けて、この範囲で進める） */
+  simBudgetMs = 8;
+  /** 追いつき中の1フレームの GPU 時間の目安 [ms]（描画はほぼ止まってよい） */
+  catchUpBudgetMs = 120;
+  /** 塊1つあたりの GPU 時間の実測（指数移動平均）[ms] */
+  msPerChunk = 2;
+  private measuring = false;
   /** 実効速度（シミュレーション秒 / 実秒）の平滑値 */
   effectiveSpeed = 0;
   /** 領域の原点（世界座標 m）。観測者が領域の中央に来るように始める */
@@ -49,8 +56,6 @@ export class SimManager {
 
   /** 追いつき（時刻ジャンプや早送り）の目標時刻（UTC ms）。null なら通常 */
   catchUpTarget: number | null = null;
-  /** 追いつき中の1フレームあたりのステップ数 */
-  catchUpSteps = 12;
   /** 雲粒数濃度（地表日射の計算用） */
   nDrop = 3e8;
 
@@ -110,9 +115,9 @@ export class SimManager {
     m.nDrop = this.nDrop;
     if (this.catchUpTarget !== null) {
       // 追いつき中：時計に関係なく多めに進める
-      let adv = 0;
-      for (let n = 0; n < this.catchUpSteps && this.simUtc < this.catchUpTarget; n++) adv += m.step(1);
-      if (this.simUtc >= this.catchUpTarget) this.catchUpTarget = null;
+      const chunks = Math.max(1, Math.floor(this.catchUpBudgetMs / this.msPerChunk));
+      const adv = this.run(m, chunks);
+      if (this.simUtc >= this.catchUpTarget && !m.midStep) this.catchUpTarget = null;
       this.moveOrigin(adv);
       this.debt = 0;
       this.effectiveSpeed = this.effectiveSpeed * 0.9 + (dtReal > 0 ? adv / dtReal : 0) * 0.1;
@@ -120,17 +125,32 @@ export class SimManager {
     }
     this.debt = Math.min(this.debt + wantSec, Math.max(m.dt * this.maxStepsPerFrame * 2, 1));
     let adv = 0;
-    let n = 0;
-    while (this.debt >= m.dt * 0.5 && n < this.maxStepsPerFrame) {
-      const a = m.step(1);
-      this.debt -= a;
-      adv += a;
-      n++;
+    // 時間の借りがあるか、ステップの途中なら、予算の範囲で塊を進める
+    if (m.midStep || this.debt >= m.dt * 0.5) {
+      const maxChunks = this.maxStepsPerFrame * CloudModel.CHUNKS_PER_STEP;
+      const chunks = Math.min(maxChunks, Math.max(1, Math.floor(this.simBudgetMs / this.msPerChunk)));
+      adv = this.run(m, chunks);
+      this.debt -= adv;
     }
     this.moveOrigin(adv);
     const sp = dtReal > 0 ? adv / dtReal : 0;
     this.effectiveSpeed = this.effectiveSpeed * 0.95 + sp * 0.05;
     return adv;
+  }
+
+  /** 塊を進め、GPU 時間を測る（提出から完了までの時間。他の処理の待ちを含むので控えめな見積もり） */
+  private run(m: CloudModel, chunks: number): number {
+    const t0 = performance.now();
+    const { used, advanced } = m.runChunks(chunks);
+    if (!this.measuring) {
+      this.measuring = true;
+      void this.device.queue.onSubmittedWorkDone().then(() => {
+        const ms = (performance.now() - t0) / used;
+        this.msPerChunk = Math.min(200, Math.max(0.05, this.msPerChunk * 0.8 + ms * 0.2));
+        this.measuring = false;
+      });
+    }
+    return advanced;
   }
 
   private moveOrigin(sec: number): void {

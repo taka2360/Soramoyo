@@ -254,56 +254,104 @@ export class CloudModel {
     return Math.min(this.cfg.dtMax, this.cfg.cfl / rate);
   }
 
+  /** 途中まで進めたステップの残りの塊（空なら次は新しいステップ） */
+  private pending: ((pass: GPUComputePassEncoder) => void)[] = [];
+  private pendingDt = 0;
+  /** 1ステップを分ける塊の数（RK3 の各段 ×（移流・発散 / 圧力・射影）＋ 微物理） */
+  static readonly CHUNKS_PER_STEP = 7;
+  /** ステップの途中か（途中でも描画用の最新状態 states[cur] は完全な状態のまま） */
+  get midStep(): boolean {
+    return this.pending.length > 0;
+  }
+
+  /** 新しいステップの塊を用意する */
+  private beginStep(): void {
+    const g = this.cfg.grid;
+    const dt = this.chooseDt();
+    this.dt = dt;
+    this.pendingDt = dt;
+    this.writeParams(dt);
+    const r = this.cur;
+    const a = (r + 1) % 3, b = (r + 2) % 3;
+    const perms: [number, number, number][] = [[r, r, a], [r, a, b], [r, b, a]];
+    const g3 = [Math.ceil(g.nx / 8), Math.ceil(g.ny / 8), g.nz] as const;
+    const g2 = [Math.ceil(g.nx / 8), Math.ceil(g.ny / 8), 1] as const;
+    const run = (pass: GPUComputePassEncoder, name: string, bg: GPUBindGroup, slot: number, x: number, y = 1, z = 1) => {
+      pass.setPipeline(this.pipes.get(name)!);
+      pass.setBindGroup(0, bg, [slot * PARAM_SLOT]);
+      pass.dispatchWorkgroups(x, y, z);
+    };
+    const chunks: ((pass: GPUComputePassEncoder) => void)[] = [];
+    perms.forEach(([nI, cI, oI], stage) => {
+      const bg = this.bind(nI, cI, oI);
+      chunks.push((pass) => {
+        if (stage === 0) run(pass, 'csNu', bg, stage, ...g3);
+        if (stage === 2 && this.cfg.moist && this.cfg.positiveDefinite !== false) run(pass, 'csPdRatio', bg, stage, ...g3);
+        run(pass, 'csScalars', bg, stage, ...g3);
+        run(pass, 'csMomentum', bg, stage, ...g3);
+        run(pass, 'csDivergence', bg, stage, ...g3);
+      });
+      chunks.push((pass) => {
+        run(pass, 'fftXf', bg, stage, g.ny, g.nz);
+        if (g.ny > 1) run(pass, 'fftYf', bg, stage, g.nx, g.nz);
+        run(pass, 'tridiag', bg, stage, ...g2);
+        if (g.ny > 1) run(pass, 'fftYi', bg, stage, g.nx, g.nz);
+        run(pass, 'fftXi', bg, stage, g.ny, g.nz);
+        run(pass, 'csProject', bg, stage, ...g3);
+      });
+    });
+    const last = this.bind(r, b, a);
+    chunks.push((pass) => {
+      run(pass, 'micro', last, 2, ...g2);
+      run(pass, 'stats', last, 2, g.nz + 1);
+    });
+    this.pending = chunks;
+    this.pendingNext = a;
+  }
+  private pendingNext = 0;
+
   /**
-   * count ステップ進める（1つのコマンドバッファにまとめる）。
+   * 最大 maxChunks 個の塊を実行する（1つのコマンドバッファ）。ステップが完了したら時刻を進める。
+   * 戻り値：使った塊の数と、進んだシミュレーション時間 [s]。
+   */
+  runChunks(maxChunks: number, wantStats = true): { used: number; advanced: number } {
+    const d = this.device;
+    let used = 0;
+    let advanced = 0;
+    let enc: GPUCommandEncoder | null = null;
+    let statsCopy = false;
+    while (used < maxChunks) {
+      if (this.pending.length === 0) this.beginStep();
+      enc ??= d.createCommandEncoder();
+      const pass = enc.beginComputePass({ label: 'sim-chunk' });
+      this.pending.shift()!(pass);
+      pass.end();
+      used++;
+      if (this.pending.length === 0) {
+        // ステップ完了。統計は読み出し中でなければ写す。次のステップの書き込み先に影響しないよう、ここで一旦提出する
+        if (wantStats && !this.statsBusy) { enc.copyBufferToBuffer(this.statsBuf, 0, this.statsRead, 0, this.statsRead.size); statsCopy = true; }
+        d.queue.submit([enc.finish()]);
+        enc = null;
+        this.cur = this.pendingNext;
+        this.time += this.pendingDt;
+        this.steps++;
+        advanced += this.pendingDt;
+        if (statsCopy) { this.readStats(this.time); statsCopy = false; }
+      }
+    }
+    if (enc) d.queue.submit([enc.finish()]);
+    return { used, advanced };
+  }
+
+  /**
+   * count ステップ進める（途中のステップがあれば、まずそれを終える）。
    * 進めたシミュレーション時間 [s] を返す。
    */
   step(count: number): number {
-    const g = this.cfg.grid;
-    const d = this.device;
     let advanced = 0;
     for (let s = 0; s < count; s++) {
-      const dt = this.chooseDt();
-      this.dt = dt;
-      this.writeParams(dt);
-      const enc = d.createCommandEncoder();
-      const pass = enc.beginComputePass({ label: 'sim-step' });
-      const r = this.cur;
-      const a = (r + 1) % 3, b = (r + 2) % 3;
-      const perms: [number, number, number][] = [[r, r, a], [r, a, b], [r, b, a]];
-      const g3 = [Math.ceil(g.nx / 8), Math.ceil(g.ny / 8), g.nz] as const;
-      const g2 = [Math.ceil(g.nx / 8), Math.ceil(g.ny / 8), 1] as const;
-      const run = (name: string, bg: GPUBindGroup, slot: number, x: number, y = 1, z = 1) => {
-        pass.setPipeline(this.pipes.get(name)!);
-        pass.setBindGroup(0, bg, [slot * PARAM_SLOT]);
-        pass.dispatchWorkgroups(x, y, z);
-      };
-      perms.forEach(([nI, cI, oI], stage) => {
-        const bg = this.bind(nI, cI, oI);
-        if (stage === 0) run('csNu', bg, stage, ...g3);
-        if (stage === 2 && this.cfg.moist && this.cfg.positiveDefinite !== false) run('csPdRatio', bg, stage, ...g3);
-        run('csScalars', bg, stage, ...g3);
-        run('csMomentum', bg, stage, ...g3);
-        run('csDivergence', bg, stage, ...g3);
-        run('fftXf', bg, stage, g.ny, g.nz);
-        if (g.ny > 1) run('fftYf', bg, stage, g.nx, g.nz);
-        run('tridiag', bg, stage, ...g2);
-        if (g.ny > 1) run('fftYi', bg, stage, g.nx, g.nz);
-        run('fftXi', bg, stage, g.ny, g.nz);
-        run('csProject', bg, stage, ...g3);
-      });
-      const last = this.bind(r, b, a);
-      run('micro', last, 2, ...g2);
-      const doStats = s === count - 1;
-      if (doStats) run('stats', last, 2, g.nz + 1);
-      pass.end();
-      if (doStats && !this.statsBusy) enc.copyBufferToBuffer(this.statsBuf, 0, this.statsRead, 0, this.statsRead.size);
-      d.queue.submit([enc.finish()]);
-      this.cur = a;
-      this.time += dt;
-      this.steps++;
-      advanced += dt;
-      if (doStats && !this.statsBusy) this.readStats(this.time);
+      const n = this.pending.length > 0 ? this.pending.length : CloudModel.CHUNKS_PER_STEP;
+      advanced += this.runChunks(n, s === count - 1).advanced;  // 統計の読み出しは最後のステップだけ（従来どおり）
     }
     return advanced;
   }

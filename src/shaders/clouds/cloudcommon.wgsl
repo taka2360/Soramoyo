@@ -7,6 +7,7 @@ struct CloudU {
   sunDir: vec3f, frame: f32,
   noisePeriod: f32, dropDiamUm: f32, groundAlbedo: f32, enabled: f32,
   histAlpha: f32, cellSize: f32, stepScale: f32, minStep: f32,   // 時間方向の蓄積の混合率、水平格子幅 [m]、レイマーチの刻み（距離比・最小 [m]）
+  shaftSamples: f32, detailHQ: f32, maxSteps: f32, pad1: f32,      // 薄明光線のサンプル数、細部合成の細かい段（0/1）、レイマーチの最大ステップ数
 };
 
 // 雲水量 [kg/m³] → 消散係数 [1/m]。有効半径は雲粒数濃度から：
@@ -59,4 +60,38 @@ fn sampleVolSmoothZ(tex: texture_3d<f32>, s: sampler, uvw: vec3f) -> vec4f {
   let a = textureSampleLevel(tex, s, vec3f(uvw.xy, h0), 0.0);
   let b = textureSampleLevel(tex, s, vec3f(uvw.xy, h1), 0.0);
   return a * g0 + b * g1;
+}
+
+// 3方向とも 3次 B スプラインで補間する（線形補間 8 回）。細部合成で縁を鋭くするとき、
+// 水平の線形補間だと格子の面に沿った平らな壁（箱のような形）が出るため、近くの雲の中だけで使う。
+fn bsplineAxis(x: f32, n: f32) -> vec4f {
+  // 戻り値：(h0, h1, g0, g1) … 正規化座標での2つの読み位置と重み
+  let xi = x * n - 0.5;
+  let i = floor(xi);
+  let f = xi - i;
+  let f2 = f * f; let f3 = f2 * f;
+  let w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;
+  let w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+  let w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0;
+  let w3 = f3 / 6.0;
+  let g0 = w0 + w1;
+  let g1 = w2 + w3;
+  return vec4f((i - 1.0 + w1 / g0 + 0.5) / n, (i + 1.0 + w3 / g1 + 0.5) / n, g0, g1);
+}
+fn sampleVolSmooth3(tex: texture_3d<f32>, s: sampler, uvw: vec3f) -> vec4f {
+  let dim = vec3f(textureDimensions(tex));
+  let ax = bsplineAxis(uvw.x, dim.x);
+  let ay = bsplineAxis(uvw.y, dim.y);
+  let az = bsplineAxis(uvw.z, dim.z);
+  var r = vec4f(0.0);
+  for (var k = 0; k < 2; k++) {
+    let z = select(az.y, az.x, k == 0);
+    let wz = select(az.w, az.z, k == 0);
+    let a = textureSampleLevel(tex, s, vec3f(ax.x, ay.x, z), 0.0);
+    let b = textureSampleLevel(tex, s, vec3f(ax.y, ay.x, z), 0.0);
+    let c = textureSampleLevel(tex, s, vec3f(ax.x, ay.y, z), 0.0);
+    let d = textureSampleLevel(tex, s, vec3f(ax.y, ay.y, z), 0.0);
+    r += wz * (ay.z * (ax.z * a + ax.w * b) + ay.w * (ax.z * c + ax.w * d));
+  }
+  return r;
 }

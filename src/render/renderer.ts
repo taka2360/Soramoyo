@@ -7,6 +7,7 @@ import atmoFunctionsWgsl from '../shaders/atmosphere/functions.wgsl?raw';
 import atmoRenderWgsl from '../shaders/atmosphere/render.wgsl?raw';
 import cloudCommonWgsl from '../shaders/clouds/cloudcommon.wgsl?raw';
 import cloudsWgsl from '../shaders/clouds/clouds.wgsl?raw';
+import resolveWgsl from '../shaders/clouds/resolve.wgsl?raw';
 import skyWgsl from '../shaders/sky.wgsl?raw';
 import exposureWgsl from '../shaders/exposure.wgsl?raw';
 import tonemapWgsl from '../shaders/tonemap.wgsl?raw';
@@ -69,6 +70,16 @@ export class Renderer {
   private expoBuf: GPUBuffer;
   private skyPipe: GPURenderPipeline;
   private cloudPipe: GPURenderPipeline;
+  private resolvePipe: GPURenderPipeline;
+  private resolveBuf: GPUBuffer;
+  private resolveBind: GPUBindGroup[] = [];
+  private linearClamp: GPUSampler;
+  private cloudRaw!: GPUTexture;
+  private cloudDepth!: GPUTexture;
+  private prevCam: number[] | null = null;
+  private historyValid = false;
+  /** 雲の時間方向の蓄積の混合率（小さいほどなめらかだが変化に遅れる） */
+  taaAlpha = 0.1;
   private expoPipe: GPUComputePipeline;
   private tonePipe: GPURenderPipeline;
   private starPipe: GPURenderPipeline;
@@ -109,7 +120,18 @@ export class Renderer {
     };
     const atmoBase = atmoFunctionsWgsl + atmoRenderWgsl + commonWgsl + cloudCommonWgsl;
     this.skyPipe = fs('sky', atmoBase + skyWgsl, HDR_FORMAT);
-    this.cloudPipe = fs('clouds', atmoBase + cloudsWgsl, HDR_FORMAT);
+    {
+      const module = device.createShaderModule({ label: 'clouds', code: atmoBase + cloudsWgsl });
+      this.cloudPipe = device.createRenderPipeline({
+        label: 'clouds', layout: 'auto',
+        vertex: { module, entryPoint: 'vsFullscreen' },
+        fragment: { module, entryPoint: 'fsMain', targets: [{ format: HDR_FORMAT }, { format: 'r32float' }] },
+        primitive: { topology: 'triangle-list' },
+      });
+    }
+    this.resolvePipe = fs('cloudResolve', commonWgsl + resolveWgsl, HDR_FORMAT);
+    this.resolveBuf = device.createBuffer({ size: 112, usage: U });
+    this.linearClamp = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
     this.tonePipe = fs('tonemap', commonWgsl + tonemapWgsl, gpu.canvasFormat);
     const starMod = device.createShaderModule({ label: 'stars', code: atmoFunctionsWgsl + commonWgsl + starsWgsl });
     this.starPipe = device.createRenderPipeline({
@@ -126,7 +148,7 @@ export class Renderer {
     const expoMod = device.createShaderModule({ label: 'exposure', code: commonWgsl + exposureWgsl });
     this.expoPipe = device.createComputePipeline({ label: 'exposure', layout: 'auto', compute: { module: expoMod, entryPoint: 'csMain' } });
 
-    this.timer = new GpuTimer(device, gpu.hasTimestamps, ['clouds', 'sky', 'stars', 'exposure', 'tonemap']);
+    this.timer = new GpuTimer(device, gpu.hasTimestamps, ['clouds', 'cloudTAA', 'sky', 'stars', 'exposure', 'tonemap']);
   }
 
   private resize(scale: number, cloudScale: number): void {
@@ -145,11 +167,23 @@ export class Renderer {
     const { device } = this.gpu;
     this.hdr?.destroy();
     this.cloudTargets.forEach((t) => t.destroy());
+    this.cloudRaw?.destroy();
+    this.cloudDepth?.destroy();
+    this.historyValid = false;
     this.hdr = device.createTexture({
       label: 'hdr', size: [w, h], format: HDR_FORMAT,
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
-    // 雲は2枚を交互に使う（前フレームの結果を履歴として読む）
+    // 雲：レイマーチの生の結果（色・透過率）と代表距離 → 時間方向の蓄積で cloudTargets[p] へ。
+    // cloudTargets は2枚を交互に使う（前フレームの結果を履歴として読む）
+    this.cloudRaw = device.createTexture({
+      label: 'cloudRaw', size: [cw, ch], format: HDR_FORMAT,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.cloudDepth = device.createTexture({
+      label: 'cloudDepth', size: [cw, ch], format: 'r32float',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
     this.cloudTargets = [0, 1].map((i) => device.createTexture({
       label: `clouds${i}`, size: [cw, ch], format: HDR_FORMAT,
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
@@ -226,7 +260,7 @@ export class Renderer {
         ],
       }));
     }
-    this.cloudBind = [0, 1].map((p) => d.createBindGroup({
+    this.cloudBind = [0, 1].map(() => d.createBindGroup({
       layout: this.cloudPipe.getBindGroupLayout(0),
       entries: [
         ...atmoEntries(this.cloudFrameBuf),
@@ -234,9 +268,20 @@ export class Renderer {
         { binding: 12, resource: c.shadow.createView() },
         { binding: 13, resource: c.zmap.createView() },
         { binding: 14, resource: c.noise.createView() },
+        { binding: 18, resource: c.vel.createView() },
+        { binding: 19, resource: c.samplerNoise },
         { binding: 15, resource: { buffer: c.uniform } },
         { binding: 16, resource: c.samplerRepeat },
-        { binding: 17, resource: this.cloudTargets[1 - p].createView() },
+      ],
+    }));
+    this.resolveBind = [0, 1].map((p) => d.createBindGroup({
+      layout: this.resolvePipe.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.resolveBuf } },
+        { binding: 1, resource: this.cloudRaw.createView() },
+        { binding: 2, resource: this.cloudDepth.createView() },
+        { binding: 3, resource: this.cloudTargets[1 - p].createView() },
+        { binding: 4, resource: this.linearClamp },
       ],
     }));
     this.bindKey = key;
@@ -245,6 +290,11 @@ export class Renderer {
 
   get size(): [number, number] {
     return [this.width, this.height];
+  }
+
+  /** 雲の時間方向の蓄積を捨てる（時刻ジャンプなどで雲が入れ替わったとき） */
+  resetHistory(): void {
+    this.historyValid = false;
   }
 
   /** 自動露出の状態をリセット（時刻ジャンプ時など、即座に順応させたいとき） */
@@ -306,7 +356,30 @@ export class Renderer {
     };
     this.parity = 1 - this.parity;
     const p = this.parity;
-    fullscreen(this.cloudTargets[p].createView(), this.cloudPipe, this.cloudBind[p], 'clouds', [0, 0, 0, 1]);
+    {
+      const pass = enc.beginRenderPass({
+        colorAttachments: [
+          { view: this.cloudRaw.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] },
+          { view: this.cloudDepth.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0] },
+        ],
+        timestampWrites: this.timer.writes('clouds'),
+      });
+      pass.setPipeline(this.cloudPipe);
+      pass.setBindGroup(0, this.cloudBind[p]);
+      pass.draw(3);
+      pass.end();
+    }
+    // 時間方向の蓄積（前フレームのカメラへ再投影）
+    {
+      const { fwd, right, up } = cam.basis();
+      const camH = sc.groundElevationM + cam.heightM;
+      const curCam = [...fwd, Math.tan(cam.fovY * 0.5), ...right, this.cw / this.ch, ...up, camH];
+      const prev = this.prevCam ?? curCam;
+      device.queue.writeBuffer(this.resolveBuf, 0, new Float32Array([...curCam, ...prev, this.taaAlpha, this.historyValid && this.prevCam ? 1 : 0, 0, 0]));
+      this.prevCam = curCam;
+      this.historyValid = true;
+    }
+    fullscreen(this.cloudTargets[p].createView(), this.resolvePipe, this.resolveBind[p], 'cloudTAA', [0, 0, 0, 1]);
     fullscreen(this.hdr.createView(), this.skyPipe, this.skyBind[p], 'sky', [0, 0, 0, 1]);
     if (this.stars && this.starBind.length) {
       const pass = enc.beginRenderPass({

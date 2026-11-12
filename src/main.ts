@@ -11,6 +11,7 @@ import { CloudVolume, type CloudSettings } from './render/clouds';
 import { SimManager, SCENARIOS } from './sim/manager';
 import { SkewT } from './ui/skewt';
 import { loadMilkyWayTexture, loadStars } from './render/nightsky';
+import { QUALITY, DEFAULT_QUALITY, applyQuality } from './ui/quality';
 
 async function main(): Promise<void> {
   const canvas = document.getElementById('sky') as HTMLCanvasElement;
@@ -23,7 +24,7 @@ async function main(): Promise<void> {
   cam.attach(canvas);
 
   const rs: RenderSettings = { exposureEV: 0, autoExposure: true, grid: false, renderScale: 1, cloudScale: 0.5, whiteBalance: true };
-  const cs: CloudSettings = { dropletsPerCc: 300, detail: 0.6, maxDistKm: 120, stepScale: 0.015, minStepM: 40 };
+  const cs: CloudSettings = { dropletsPerCc: 300, detail: 1, maxDistKm: 120, stepScale: 0.015, minStepM: 40, maxSteps: 320, shaftSamples: 24, detailHQ: true };
   const atmoSettings = { ...DEFAULT_ATMOSPHERE };
   const lutOpt: PrecomputeOptions = { wavelengthGroups: 8, scatteringOrders: 6 };
 
@@ -66,6 +67,8 @@ async function main(): Promise<void> {
   };
   recompute();
 
+  const quality = { preset: DEFAULT_QUALITY };
+  applyQuality(quality.preset, rs, cs, sim);
   const panel = buildPanel({ clock, obs, rs, cam, atmo: atmoSettings, lutOpt, onAtmosphereChange: recompute, onJump: () => renderer.resetAdaptation() });
 
   // ---- 雲シミュレーションの UI
@@ -76,18 +79,24 @@ async function main(): Promise<void> {
     ahead: () => { sim.catchUpTarget = sim.simUtc + 2 * 3600_000; },
     reset: () => { sim.loadFor(simUi.scenario, obs.latDeg, clock.utcMs, obs.utcOffsetHours); cloudVol.attach(sim.model); },
   };
+  // 画質プリセット（描画の細かさと1フレームの計算量。個別の値は各フォルダで微調整できる）
+  panel.gui.add(quality, 'preset', Object.keys(QUALITY)).name('画質').onChange((name: string) => {
+    applyQuality(name, rs, cs, sim);
+    panel.gui.controllersRecursive().forEach((c) => c.updateDisplay());
+  });
   const fs = panel.gui.addFolder('雲シミュレーション');
   fs.add(simUi, 'scenario', Object.keys(SCENARIOS)).name('大気の状態').onChange(() => simUi.reset());
   fs.add(simUi, 'enabled').name('雲を計算・表示').onChange((v: boolean) => {
     if (v) simUi.reset(); else { sim.unload(); cloudVol.attach(null); }
   });
   fs.add(sim, 'running').name('計算を進める');
+  fs.add(sim, 'simBudgetMs', 1, 30, 0.5).name('計算の GPU 予算 [ms/フレーム]');
   fs.add(sim, 'maxStepsPerFrame', 1, 20, 1).name('1フレームの最大ステップ');
-  fs.add(sim, 'catchUpSteps', 1, 60, 1).name('追いつき時のステップ数');
+  fs.add(sim, 'catchUpBudgetMs', 20, 400, 10).name('追いつき時の GPU 予算 [ms]');
   fs.add(simUi, 'ahead').name('2時間先へ早送り');
   fs.add(simUi, 'reset').name('初期状態に戻す');
   fs.add(cs, 'dropletsPerCc', 30, 1500, 10).name('雲粒の数 [個/cm³]');
-  fs.add(cs, 'detail', 0, 2, 0.05).name('細部合成の強さ');
+  fs.add(cs, 'detail', 0, 1, 0.05).name('細部合成の強さ');
   fs.add(cs, 'maxDistKm', 10, 200, 5).name('雲を描く距離 [km]');
   const fn = panel.gui.addFolder('夜空');
   fn.add(night, 'skyMag', 16, 22, 0.1).name('天頂の明るさ [等/秒角²]（22=光害なし）');
@@ -100,12 +109,11 @@ async function main(): Promise<void> {
   fs.add(skewUi, 'show').name('Skew-T 図を表示').onChange((v: boolean) => skewT.setVisible(v));
 
   // 開発・検証用（コンソールから時刻や視線を操作する）
-  (window as unknown as { __sora: unknown }).__sora = { clock, obs, cam, rs, cs, atmoSettings, lutOpt, recompute, renderer, sim, cloudVol, simUi };
+  (window as unknown as { __sora: unknown }).__sora = { clock, obs, cam, rs, cs, atmoSettings, lutOpt, recompute, renderer, sim, cloudVol, simUi, quality, applyQuality: (n: string) => applyQuality(n, rs, cs, sim) };
 
   let last = performance.now();
   let fps = 60;
   let uiTick = 0;
-  let lastCamKey = '';
   let lastClockSet = clock.utcMs;
   let pendingJump: { target: number; at: number } | null = null;
   const frame = (now: number) => {
@@ -125,6 +133,7 @@ async function main(): Promise<void> {
           sim.jumpTo(pendingJump.target, obs.latDeg, obs.utcOffsetHours);
           cloudVol.attach(sim.model);
           renderer.resetAdaptation();
+          renderer.resetHistory();
         }
         pendingJump = null;
       }
@@ -145,10 +154,7 @@ async function main(): Promise<void> {
     simStatus = sim.catchUpTarget !== null ? `追いつき中（あと ${((sim.catchUpTarget - sim.simUtc) / 3600_000).toFixed(1)} 時間）` : '';
 
     const eph = computeEphemeris(clock.julianDayUT, obs, obs.elevationM + cam.heightM);
-    // カメラが動いたら雲の時間蓄積をやり直す（再投影はまだ無いため）
-    const camKey = `${cam.azimuth.toFixed(5)},${cam.altitude.toFixed(5)},${cam.fovY.toFixed(5)},${cam.heightM.toFixed(2)},${canvas.clientWidth}x${canvas.clientHeight},${rs.renderScale},${rs.cloudScale}`;
-    const histAlpha = camKey === lastCamKey ? 0.15 : 1;
-    lastCamKey = camKey;
+    const histAlpha = renderer.taaAlpha; // 時間方向の蓄積は renderer の再投影パスで行う
     const lightDir = eph.sunDir[2] < -0.1 ? eph.moonDir : eph.sunDir; // 雲の影を作る主光源（renderer と同じ判定）
     cloudVol.writeUniform(sim.origin, lightDir, sim.model?.time ?? 0, cs, atmoSettings.groundAlbedo, histAlpha);
     if (sim.model && !sim.busy) cloudVol.update();
@@ -181,7 +187,7 @@ async function main(): Promise<void> {
         `${w}×${h}  ${fps.toFixed(0)} fps` +
         (renderer.timer.enabled ? `  GPU[ms] ${gpuMs}` : '  (GPU 計測なし)') +
         (sim.model
-          ? `\n雲: ${sim.simCase!.name}  経過 ${(sim.model.time / 3600).toFixed(2)} 時間  dt ${sim.model.dt.toFixed(2)} s  実効 ×${sim.effectiveSpeed.toFixed(0)}` +
+          ? `\n雲: ${sim.simCase!.name}  経過 ${(sim.model.time / 3600).toFixed(2)} 時間  dt ${sim.model.dt.toFixed(2)} s  実効 ×${sim.effectiveSpeed.toFixed(0)}（1ステップ ${(sim.msPerChunk * 7).toFixed(0)} ms）` +
             (sim.model.lastStats
               ? `\n雲底 ${((sim.model.lastStats.cloudBase ?? NaN) / 1000).toFixed(2)} km  雲頂 ${((sim.model.lastStats.cloudTop ?? NaN) / 1000).toFixed(2)} km  w最大 ${sim.model.lastStats.maxW.toFixed(1)} m/s  LWP ${sim.model.lastStats.lwp.toFixed(1)} g/m²` +
                 (sim.simCase!.config.surfaceEnergy
