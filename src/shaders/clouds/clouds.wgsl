@@ -193,15 +193,21 @@ fn sampleMedium(p: vec3f, h: f32, withShadow: bool) -> Medium {
 // ---------------------------------------------------------------- 薄明光線
 // 雲の影に入った空気は太陽光を散乱しない。視線上で「影のせいで欠けた単散乱光」を見積もって差し引く。
 // （空の輝度 LUT は雲の無い大気の値なので、その差分として扱う。多重散乱の欠けは無視）
-fn shaftDeficit(o: vec3f, d: vec3f, tEnd: f32, sun: vec3f, jitter: f32) -> vec3f {
-  if (sun.z <= 0.01) { return vec3f(0.0); }
+// 戻り値：lost = 影で欠けた単散乱光、full = 影が無い場合の単散乱光（同じ区間・同じ式）
+struct Shaft { lost: vec3f, full: vec3f };
+fn shaftDeficit(o: vec3f, d: vec3f, tEnd: f32, sun: vec3f, jitter: f32) -> Shaft {
+  var res: Shaft;
+  res.lost = vec3f(0.0);
+  res.full = vec3f(0.0);
+  if (sun.z <= 0.01) { return res; }
   let tmax = min(tEnd, 40000.0);
-  if (tmax <= 0.0) { return vec3f(0.0); }
+  if (tmax <= 0.0) { return res; }
   let camR = A.bottom_radius + o.z / 1000.0;
   let nu = dot(d, sun);
   let pr = rayleighPhase(nu);
   let pm = miePhase(A.mie_g, nu);
   var acc = vec3f(0.0);
+  var accFull = vec3f(0.0);
   let N = i32(C.shaftSamples);
   var tPrev = 0.0;
   for (var i = 0; i < N; i++) {
@@ -211,6 +217,14 @@ fn shaftDeficit(o: vec3f, d: vec3f, tEnd: f32, sun: vec3f, jitter: f32) -> vec3f
     tPrev = t;
     let p = o + d * t;
     let h = altitude(p);
+    let rKm = A.bottom_radius + h / 1000.0;
+    let up = normalize(p - vec3f(0.0, 0.0, -EARTH_R_M));
+    let sunE = F.lightIllum * getTransmittanceToSun(rKm, dot(up, sun));
+    let hk = h / 1000.0;
+    let scat = A.rayleigh_scattering * exp(-hk / 8.0) * pr + A.mie_scattering * exp(-hk / A.mie_scale_height) * pm; // [1/km]
+    let tv = getTransmittance(camR, d.z, t / 1000.0, rayIntersectsGround(camR, d.z));
+    let c = tv * sunE * scat * (dt / 1000.0);
+    accFull += c;
     if (h > C.slabTop) { continue; }
     var q = p;
     if (h < C.slabBot) { q = p + sun * ((C.slabBot + 1.0 - h) / sun.z); }
@@ -218,17 +232,21 @@ fn shaftDeficit(o: vec3f, d: vec3f, tEnd: f32, sun: vec3f, jitter: f32) -> vec3f
     let od = sunShadowAt(q, hq, false);
     let shadowFrac = 1.0 - exp(-od);
     if (shadowFrac <= 0.001) { continue; }
-    let rKm = A.bottom_radius + h / 1000.0;
-    let up = normalize(p - vec3f(0.0, 0.0, -EARTH_R_M));
-    let sunE = F.lightIllum * getTransmittanceToSun(rKm, dot(up, sun));
-    let hk = h / 1000.0;
-    let scat = A.rayleigh_scattering * exp(-hk / 8.0) * pr + A.mie_scattering * exp(-hk / A.mie_scale_height) * pm; // [1/km]
-    let tv = getTransmittance(camR, d.z, t / 1000.0, rayIntersectsGround(camR, d.z));
-    acc += tv * sunE * scat * (dt / 1000.0) * shadowFrac;
+    acc += c * shadowFrac;
   }
   // 数値の破綻（NaN/Inf）が露出計算に波及しないように
-  if (any(acc != acc) || any(acc > vec3f(1e9))) { return vec3f(0.0); }
-  return acc;
+  if (any(acc != acc) || any(acc > vec3f(1e9)) || any(accFull != accFull)) { return res; }
+  res.lost = acc;
+  res.full = accFull;
+  return res;
+}
+
+// 欠けを、同じ区間の空気遠近（LUT, 多重散乱込み）の散乱光 inScat に対して整合させる。
+// 解析式の単散乱は地平線近く・太陽の近くで LUT より大きくなることがあり（特に赤）、
+// そのまま引くと負になって雲や空が青緑になるので、「LUT の散乱光 × 影に入った割合」を上限にする
+fn shaftLimit(sh: Shaft, inScat: vec3f) -> vec3f {
+  let frac = clamp(sh.lost / max(sh.full, vec3f(1e-20)), vec3f(0.0), vec3f(1.0));
+  return min(sh.lost, max(inScat, vec3f(0.0)) * frac);
 }
 
 fn ignNoise(p: vec2f) -> f32 {
@@ -335,7 +353,7 @@ fn march(in: VsOut) -> vec4f {
       let up = normalize(p - vec3f(0.0, 0.0, -EARTH_R_M));
       let muS = dot(up, sun);
       let sunE = F.lightIllum * getTransmittanceToSun(rKm, muS);
-      let skyE = getIrradiance(rKm, muS) * F.lightScale;
+      let skyE = getIrradianceLit(rKm, muS) * F.lightScale;
       var S = vec3f(0.0);
       var a = 1.0; var b = 1.0;
       for (var oc = 0; oc < 4; oc++) {
@@ -370,13 +388,19 @@ fn march(in: VsOut) -> vec4f {
   var tShaft = 40000.0;
   if (sg.x > 0.0) { tShaft = sg.x; }
   if (wsum > 0.0) { tShaft = depthW / wsum; }
-  let deficit = shaftDeficit(o, d, tShaft, sun, jitter);
-  if (wsum <= 0.0) { return vec4f(-deficit * pre, 1.0); }
+  let sh = shaftDeficit(o, d, tShaft, sun, jitter);
+  if (wsum <= 0.0) {
+    if (all(sh.lost <= vec3f(0.0))) { return vec4f(0.0, 0.0, 0.0, 1.0); }
+    let apS = getSkyRadianceToPoint(camKm, camKm + d * (tShaft / 1000.0), sun);
+    return vec4f(-shaftLimit(sh, apS.radiance * F.lightScale) * pre, 1.0);
+  }
   // 空気遠近：雲の平均的な距離までの大気の散乱と透過
   let dist = depthW / wsum;
   gDepth = dist;
   let pKm = camKm + d * (dist / 1000.0);
   let ap = getSkyRadianceToPoint(camKm, pKm, sun);
-  let col = ap.radiance * (1.0 - T) + ap.transmittance * L - deficit;
+  // LUT は太陽の明るさで作ってあるので、主光源が月のときは明るさの比を掛ける
+  let deficit = shaftLimit(sh, ap.radiance * F.lightScale);
+  let col = ap.radiance * F.lightScale * (1.0 - T) + ap.transmittance * L - deficit;
   return vec4f(col * pre, T);
 }

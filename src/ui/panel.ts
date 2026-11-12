@@ -83,6 +83,7 @@ export function buildPanel(d: PanelDeps): { refresh: () => void; gui: GUI } {
   fv.add(rs, 'autoExposure').name('自動露出（目の順応）');
   fv.add(rs, 'exposureEV', -10, 10, 0.1).name('露出補正 [EV]');
   fv.add(rs, 'whiteBalance').name('太陽光を白に（色順応）');
+  fv.add(rs, 'glare').name('まぶしさ（目の中の散乱）');
   fv.add(rs, 'grid').name('方位・高度の目盛り');
   fv.add(rs, 'renderScale', { '50%': 0.5, '75%': 0.75, '100%': 1 }).name('描画解像度');
   fv.add(rs, 'cloudScale', { '1/4': 0.25, '1/3': 0.333, '1/2': 0.5, '等倍': 1 }).name('雲の描画解像度');

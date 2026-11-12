@@ -23,7 +23,7 @@ async function main(): Promise<void> {
   const cam = new Camera();
   cam.attach(canvas);
 
-  const rs: RenderSettings = { exposureEV: 0, autoExposure: true, grid: false, renderScale: 1, cloudScale: 0.5, whiteBalance: true };
+  const rs: RenderSettings = { exposureEV: 0, autoExposure: true, grid: false, renderScale: 1, cloudScale: 0.5, whiteBalance: true, glare: true };
   const cs: CloudSettings = { dropletsPerCc: 300, detail: 1, maxDistKm: 120, stepScale: 0.015, minStepM: 40, maxSteps: 320, shaftSamples: 24, detailHQ: true };
   const atmoSettings = { ...DEFAULT_ATMOSPHERE };
   const lutOpt: PrecomputeOptions = { wavelengthGroups: 8, scatteringOrders: 6 };
@@ -129,6 +129,7 @@ async function main(): Promise<void> {
   let uiTick = 0;
   let lastClockSet = clock.utcMs;
   let pendingJump: { target: number; at: number } | null = null;
+  let wasRunning = sim.running;
   const frame = (now: number) => {
     const dtReal = Math.min(0.1, (now - last) / 1000);
     last = now;
@@ -136,13 +137,21 @@ async function main(): Promise<void> {
 
     // 時計と雲シミュレーション：計算が追いつく範囲で時計を進める
     // ユーザーが時計を動かしたら、操作が落ち着いてから（0.4秒）追いつき or 計算し直し
+    // 「計算を進める」を再開したとき：止めている間に進んだ時計に雲の計算を合わせる（追いつき or 計算し直し）
+    if (sim.model && sim.running && !wasRunning && Math.abs(clock.utcMs - sim.simUtc) > 1000) {
+      pendingJump = { target: clock.utcMs, at: -Infinity };
+      lastClockSet = clock.utcMs;
+    }
+    wasRunning = sim.running;
     if (sim.model && Math.abs(clock.utcMs - lastClockSet) > 1000) {
       pendingJump = { target: clock.utcMs, at: now };
       lastClockSet = clock.utcMs;
     }
     if (pendingJump && sim.model) {
       if (now - pendingJump.at > 400) {
-        if (Math.abs(pendingJump.target - sim.simUtc) > 120_000) {
+        if (!sim.running) {
+          // 計算を止めている間の時刻操作は、再開時にまとめて合わせる
+        } else if (Math.abs(pendingJump.target - sim.simUtc) > 120_000 || pendingJump.at === -Infinity) {
           sim.jumpTo(pendingJump.target, obs.latDeg, obs.utcOffsetHours);
           cloudVol.attach(sim.model);
           renderer.resetAdaptation();
@@ -161,8 +170,10 @@ async function main(): Promise<void> {
       sim.frame(want, dtReal);
       clock.utcMs = sim.simUtc;
       lastClockSet = clock.utcMs;
-    } else if (!sim.model) {
+    } else if (!sim.model || !sim.running) {
+      // 雲の計算が無い・止めているときは時計だけ進める（雲はその状態のまま、太陽や星は動く）
       clock.advance(dtReal);
+      lastClockSet = clock.utcMs;
     }
     simStatus = sim.catchUpTarget !== null ? `追いつき中（あと ${((sim.catchUpTarget - sim.simUtc) / 3600_000).toFixed(1)} 時間）` : '';
 

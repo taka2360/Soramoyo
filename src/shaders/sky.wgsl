@@ -16,12 +16,16 @@ fn preExposure() -> f32 { return 1.0 / max(expo[0], 1e-4); }
 @group(0) @binding(16) var smpRep: sampler;
 
 // 地点 p（地球中心基準 km）の地表での、雲による太陽光の透過率
-fn cloudShadowAtGround(p: vec3f) -> f32 {
+fn cloudShadowAtGround(p: vec3f) -> f32 { return cloudLightTransmittance(p, 1.0); }
+
+// 地点 p の上 hM [m] での、雲による主光源（影テクスチャの光源）の透過率
+fn cloudLightTransmittance(p: vec3f, hM: f32) -> f32 {
   if (C.enabled < 0.5) { return 1.0; }
   let lx = p.x * 1000.0 - C.origin.x;
   let ly = p.y * 1000.0 - C.origin.y;
   let tm = tileMap(lx, ly, C.size);
-  let uvw = vec3f(tm.xy, zToW(zmap, 1.0, C.ztop, C.nz));
+  if (hM > C.ztop) { return 1.0; }
+  let uvw = vec3f(tm.xy, zToW(zmap, hM, C.ztop, C.nz));
   let s = textureSampleLevel(shadowVol, smpRep, uvw, 0.0);
   let s2 = textureSampleLevel(shadowVol2, smpRep, uvw, 0.0);
   return exp(-pickSunOd(s, s2, tm.zw));
@@ -38,9 +42,32 @@ fn toHdr(L: vec3f) -> vec3f {
 fn sunAndSkyIrradiance(p: vec3f, n: vec3f, sun: vec3f) -> array<vec3f, 2> {
   let r = length(p);
   let muS = dot(p, sun) / r;
-  let sky = getIrradiance(r, muS) * (1.0 + dot(n, p) / r) * 0.5;
+  let sky = getIrradianceLit(r, muS) * (1.0 + dot(n, p) / r) * 0.5;
   let direct = F.sunIllum * getTransmittanceToSun(r, muS) * max(dot(n, sun), 0.0) * cloudShadowAtGround(p);
   return array<vec3f, 2>(direct, sky);
+}
+
+// ---------------------------------------------------------------- まぶしさ（目の中の散乱による光幕）
+// CIE 2002 の一般減能グレア式（Vos & van den Berg, CIE 146:2002）：
+//   L_veil / E = 10/θ³ + (5/θ² + 0.1p/θ)(1 + (A/62.5)⁴) + 0.0025p   [cd/m² / lx]
+// θ：光源からの角度 [度]（0.1°〜100° で有効）、A：年齢（25 歳）、p：眼の色素の係数（0.5 = 茶色の目）。
+// E は目の位置での光源の照度（光線に垂直な面。視軸からの角度による瞳への入射の減少は無視）。
+// 光源は雲を照らす主光源（昼は太陽、夜は月）だけ。大気の透過と雲の透過（影テクスチャ）を掛ける。
+fn glareVeil(view: vec3f) -> vec3f {
+  if (F.glare < 0.5) { return vec3f(0.0); }
+  let isSun = dot(F.lightDir, F.sunDir) > 0.99999;
+  let lApp = select(F.moonDirApp, F.sunDirApp, isSun);
+  let cam = F.camPos;
+  let r = length(cam);
+  let E = F.lightIllum * getTransmittanceToSun(r, dot(cam, F.lightDir) / r)
+        * cloudLightTransmittance(cam, F.camHeightM);
+  if (luminance(E) <= 0.0) { return vec3f(0.0); }
+  let th = max(2.0 * asin(clamp(length(view - lApp) * 0.5, 0.0, 1.0)) * 180.0 / PI, 0.1);
+  let A = 25.0;
+  let pg = 0.5;
+  let ageF = 1.0 + pow(A / 62.5, 4.0);
+  let k = 10.0 / (th * th * th) + (5.0 / (th * th) + 0.1 * pg / th) * ageF + 0.0025 * pg;
+  return E * k;
 }
 
 // ---------------------------------------------------------------- 大気差（見かけ → 真）
@@ -128,21 +155,23 @@ fn groundFootprint(tKm: f32) -> f32 {
 // 波長の帯ごとに等しく配る（傾斜のスペクトルは波数の対数あたりおおむね一定）。
 // 画素より細かい波は形として描かず、その分の傾斜の分散を微小面の粗さ（Beckmann 分布）に回す。
 // → 近くでは波の形とまばらなきらめき、遠くでは統計的に正しい太陽の照り返しの帯になる。
+// 波の表（src/render/oceanWaves.ts）：x = 波長 [m]（固定）, y = 風下からの向きのずれ [rad], z = 位相 [rad]（CPU で ω を積分済み）,
+// w = 傾斜の分散の配分（合計 1。ピーク波長より長い波は 0）
 const N_WAVES: i32 = 64;
+@group(0) @binding(21) var<uniform> WAVES: array<vec4f, 64>;
 struct Waves { slope: vec2f, roughVar: f32 };
 // fpAcross：視線に横向きの画素の幅 [m]、hv：視線の水平成分の向き、cosV：視線と鉛直のなす角の余弦
-fn oceanWaves(xy: vec2f, t: f32, fpAcross: f32, hv: vec2f, cosV: f32) -> Waves {
+fn oceanWaves(xy: vec2f, fpAcross: f32, hv: vec2f, cosV: f32) -> Waves {
   let U = max(F.windSpeed, 0.5);
   let total = 0.003 + 5.12e-3 * U;
-  let band = total / f32(N_WAVES);
-  let lMin = 0.02;
-  let lMax = max(4.0, 0.83 * U * U); // Pierson–Moskowitz のピーク波長 ≈ 2πU² / (0.877² g)
   var s = vec2f(0.0);
   var res = 0.0;
   for (var i = 0; i < N_WAVES; i++) {
-    let fi = f32(i);
-    let lam = lMin * pow(lMax / lMin, (fi + hash11(fi * 3.1)) / f32(N_WAVES));
-    let a = F.windAngle + (hash11(fi * 0.917 + 7.7) - 0.5) * 2.4;
+    let wv = WAVES[i];
+    if (wv.w <= 0.0) { continue; }
+    let lam = wv.x;
+    let band = total * wv.w;
+    let a = F.windAngle + wv.y;
     let d = vec2f(cos(a), sin(a));
     // この波の進む向きに測った画素の大きさ（視線方向に進む波ほど粗く見える）
     let dd = dot(d, hv);
@@ -150,7 +179,7 @@ fn oceanWaves(xy: vec2f, t: f32, fpAcross: f32, hv: vec2f, cosV: f32) -> Waves {
     let fade = smoothstep(4.0, 8.0, lam / fp);
     if (fade <= 0.0) { continue; }
     let k = 2.0 * PI / lam;
-    let ph = k * dot(d, xy) - sqrt(9.81 * k) * t + hash11(fi * 1.7 + 0.3) * 2.0 * PI;
+    let ph = k * dot(d, xy) - wv.z;
     s += d * (sqrt(2.0 * band) * sin(ph) * fade);
     res += band * fade;
   }
@@ -188,7 +217,7 @@ fn oceanRadiance(p: vec3f, view: vec3f, tKm: f32, eDown: vec3f, moonRatio: f32, 
   let v = -view;
   let cosV = max(dot(v, up), 1e-3);
   let hv = normalize(view.xy + vec2f(1e-6, 0.0));
-  let w = oceanWaves(p.xy * 1000.0, F.time, groundFootprint(tKm), hv, cosV);
+  let w = oceanWaves(p.xy * 1000.0, groundFootprint(tKm), hv, cosV);
   var n = normalize(up - vec3f(w.slope, 0.0));
   // 見えない側を向いた面（斜めから見るとき）は、視線に向くよう起こす
   let nv0 = dot(n, v);
@@ -258,27 +287,26 @@ fn landAlbedo(xy: vec2f, fp: f32) -> vec3f {
   return F.groundAlbedo * max(1.0 + 1.1 * v, 0.2) * tint;
 }
 
-@fragment
-fn fsMain(in: VsOut) -> @location(0) vec4f {
-  let view = viewDir(F, in.uv);
+// 視点から地面（地球の球面）までの距離 [km]（当たらなければ負）
+fn groundDistance(view: vec3f) -> f32 {
+  let cam = F.camPos;
+  let r = length(cam);
+  let rmu = dot(cam, view);
+  let disc = rmu * rmu - r * r + A.bottom_radius * A.bottom_radius;
+  if (disc < 0.0) { return -1.0; }
+  return -rmu - sqrt(disc);
+}
+
+// 視線 view（見かけの方向）の輝度 [cd/m²]。angPx / angMPx は太陽・月の視角の1画素あたりの変化（縁の滑らかさ用）
+fn shadeView(view: vec3f, angPx: f32, angMPx: f32) -> vec3f {
   let cam = F.camPos;
   let sun = F.sunDir;
   let moon = F.moonDir;
-  let r = length(cam);
-  let rmu = dot(cam, view);
   let moonRatio = luminance(F.moonIllum) / luminance(F.sunIllum);
-
-  // 地面（地球の球面）との交差
-  let disc = rmu * rmu - r * r + A.bottom_radius * A.bottom_radius;
-  var tGround = -1.0;
-  if (disc >= 0.0) { tGround = -rmu - sqrt(disc); }
-
-  // 太陽面・月面の判定用の角度（fwidth は一様な制御フローで呼ぶ必要があるため分岐の外で計算）
+  let tGround = groundDistance(view);
   let dTrue = apparentToTrue(view);
   let ang = 2.0 * asin(clamp(length(dTrue - sun) * 0.5, 0.0, 1.0)); // 小角度でも精度が落ちない形
-  let angPx = fwidth(ang) + 1e-7;
   let angM = 2.0 * asin(clamp(length(dTrue - moon) * 0.5, 0.0, 1.0));
-  let angMPx = fwidth(angM) + 1e-7;
 
   var L: vec3f;
   if (tGround > 0.0) {
@@ -289,7 +317,7 @@ fn fsMain(in: VsOut) -> @location(0) vec4f {
     let rp = length(p);
     let muM = dot(p, moon) / rp;
     let eMoon = F.moonIllum * getTransmittanceToSun(rp, muM) * max(dot(n, moon), 0.0)
-              + getIrradiance(rp, muM) * moonRatio;
+              + getIrradianceLit(rp, muM) * moonRatio;
     let eDown = e[0] + e[1] + eMoon;
     var groundL: vec3f;
     if (F.surface > 0.5) {
@@ -327,6 +355,36 @@ fn fsMain(in: VsOut) -> @location(0) vec4f {
     L += outer * s.transmittance;
   }
 
+  return L;
+}
+
+@fragment
+fn fsMain(in: VsOut) -> @location(0) vec4f {
+  let view = viewDir(F, in.uv);
+  let sun = F.sunDir;
+  let moon = F.moonDir;
+
+  // 太陽面・月面の縁の幅（fwidth は一様な制御フローで呼ぶ必要があるため分岐の外で計算）
+  let dTrue = apparentToTrue(view);
+  let angPx = fwidth(2.0 * asin(clamp(length(dTrue - sun) * 0.5, 0.0, 1.0))) + 1e-7;
+  let angMPx = fwidth(2.0 * asin(clamp(length(dTrue - moon) * 0.5, 0.0, 1.0))) + 1e-7;
+
+  // 地平線をまたぐ画素は縦に4点で平均する。地平線すれすれの視線は数十 km 先の地面に当たり
+  // （空気遠近で青白い）、その細い帯を画素の中心1点で拾うと、地平線の曲がり具合で一部の列だけに線が出るため
+  let px = 1.0 / F.resolution.y; // NDC で画素の半分の高さ
+  let gTop = groundDistance(viewDir(F, in.uv + vec2f(0.0, px))) > 0.0;
+  let gBot = groundDistance(viewDir(F, in.uv - vec2f(0.0, px))) > 0.0;
+  var L: vec3f;
+  if (gTop != gBot) {
+    L = vec3f(0.0);
+    for (var k = 0; k < 4; k++) {
+      let o = (f32(k) - 1.5) * 0.5 * px;
+      L += shadeView(viewDir(F, in.uv + vec2f(0.0, o)), angPx, angMPx) * 0.25;
+    }
+  } else {
+    L = shadeView(view, angPx, angMPx);
+  }
+
   if (F.gridOn > 0.5) {
     let alt = asin(clamp(view.z, -1.0, 1.0)) * 180.0 / PI;
     let az = atan2(view.x, view.y) * 180.0 / PI;
@@ -338,6 +396,7 @@ fn fsMain(in: VsOut) -> @location(0) vec4f {
   let cuv = in.pos.xy / F.resolution;
   let cl = textureSampleLevel(cloudTex, smp, cuv, 0.0);
   var outc = max(toHdr(L) * cl.a + cl.rgb, vec3f(0.0)); // rgb は薄明光線の分だけ負になりうる
+  outc += toHdr(glareVeil(view));                      // 目の中の散乱なので、雲の合成の後に足す
   let m = max(outc.r, max(outc.g, outc.b));
   if (!(m < 3.0e38)) { outc = vec3f(0.0); }            // NaN / Inf の画素は捨てる（比較は NaN で偽になる）
   else if (m > 60000.0) { outc = outc * (60000.0 / m); }

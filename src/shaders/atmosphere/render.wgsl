@@ -1,6 +1,9 @@
 // Bruneton 2017 の描画用関数（functions.wgsl の後ろに連結）。空・地面・雲の空気遠近で共有。
 
 // ---------------------------------------------------------------- Bruneton の描画関数
+// LUT は 1AU の太陽で計算しているので、描画時に地球–太陽距離の倍率 (1AU/d)² を掛ける（F は各パスで宣言）
+fn getIrradianceLit(r: f32, muS: f32) -> vec3f { return getIrradiance(r, muS) * F.sunDistScale; }
+
 struct SkyOut { radiance: vec3f, transmittance: vec3f };
 
 fn skyScattering(r: f32, mu: f32, muS: f32, nu: f32, hitGround: bool) -> vec3f {
@@ -29,7 +32,7 @@ fn getSkyRadiance(camIn: vec3f, view: vec3f, sun: vec3f) -> SkyOut {
   let nu = dot(view, sun);
   let hitGround = rayIntersectsGround(r, mu);
   o.transmittance = select(getTransmittanceToTop(r, mu), vec3f(0.0), hitGround);
-  o.radiance = skyScattering(r, mu, muS, nu, hitGround);
+  o.radiance = skyScattering(r, mu, muS, nu, hitGround) * F.sunDistScale;
   return o;
 }
 
@@ -62,7 +65,7 @@ fn getSkyRadianceToPoint(camIn: vec3f, point: vec3f, sun: vec3f) -> SkyOut {
   let ray = max(ray0 - o.transmittance * ray1, vec3f(0.0));
   var mie = max(mie0 - o.transmittance * mie1, vec3f(0.0));
   mie *= smoothstep(0.0, 0.01, muS); // Bruneton と同じ：地平線下の太陽での Mie の誤差を抑える
-  o.radiance = ray * rayleighPhase(nu) + mie * miePhase(A.mie_g, nu);
+  o.radiance = (ray * rayleighPhase(nu) + mie * miePhase(A.mie_g, nu)) * F.sunDistScale;
   return o;
 }
 

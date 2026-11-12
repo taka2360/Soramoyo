@@ -18,6 +18,8 @@ export interface Ephemeris {
   sunDirApparent: [number, number, number];
   sunAngularRadius: number;
   sunDistanceAU: number;
+  /** 地球–太陽距離による明るさの倍率 (1AU/d)²（sunIlluminance には掛け済み） */
+  sunDistScale: number;
   sunIlluminance: number[];
   whitePoint: number[];
   /** 大気差の倍率（観測高度の気圧による） */
@@ -61,8 +63,9 @@ function lsDiskMean(phaseRad: number): number {
 /**
  * 太陽・月の方向など。viewerAltitudeM は大気差の気圧補正用（標高＋視点の高さ）。
  *
- * 注：大気散乱 LUT は 1AU の太陽で計算しているので、地球–太陽距離による
- * ±3.4% の明るさの変化は太陽面・直達光にも入れていない（空と整合させるため）。
+ * 地球–太陽距離による明るさの変化（±3.4%）：sunIlluminance に (1AU/d)² を掛け、
+ * 1AU で計算した大気散乱 LUT の出力にも描画時に同じ倍率（sunDistScale）を掛ける。
+ * 月の照度は月の距離・位相で別に求めている（太陽距離の変化は無視、±3%）。
  */
 export function computeEphemeris(jdUT: number, obs: Observer, viewerAltitudeM: number): Ephemeris {
   const sun = sunEquatorial(jdUT);
@@ -89,7 +92,8 @@ export function computeEphemeris(jdUT: number, obs: Observer, viewerAltitudeM: n
     sunDirApparent: app,
     sunAngularRadius: sunAngularRadius(sun.distance),
     sunDistanceAU: sun.distance,
-    sunIlluminance: SUN_TOA,
+    sunDistScale: 1 / (sun.distance * sun.distance),
+    sunIlluminance: SUN_TOA.map((c) => c / (sun.distance * sun.distance)),
     whitePoint: SUN_WHITE,
     refractionScale: pressureScale,
     moonDir: moonTopo,

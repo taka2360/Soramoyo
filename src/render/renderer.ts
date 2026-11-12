@@ -14,10 +14,11 @@ import tonemapWgsl from '../shaders/tonemap.wgsl?raw';
 import starsWgsl from '../shaders/stars.wgsl?raw';
 import type { StarData } from './nightsky';
 import { GpuTimer } from './gpuTimer';
+import { OceanWaves } from './oceanWaves';
 import type { CloudVolume } from './clouds';
 
 export const HDR_FORMAT: GPUTextureFormat = 'rgba16float';
-const FRAME_FLOATS = 72;
+const FRAME_FLOATS = 76;
 
 export interface RenderSettings {
   /** 露出補正 [EV] */
@@ -30,6 +31,8 @@ export interface RenderSettings {
   cloudScale: number;
   /** 太陽光を白とみなす色順応 */
   whiteBalance: boolean;
+  /** 太陽・月のまぶしさ（目の中の散乱による光幕） */
+  glare: boolean;
 }
 
 /** フレームごとに CPU で求める天体・環境の状態 */
@@ -62,6 +65,8 @@ export interface SceneState {
   /** 海上の風速 [m/s] と風が吹いていく向き [rad, 東から反時計回り] */
   windSpeed: number;
   windAngle: number;
+  /** 地球–太陽距離による明るさの倍率 (1AU/d)²。sunIlluminance には掛け済み */
+  sunDistScale: number;
 }
 
 /**
@@ -70,6 +75,8 @@ export interface SceneState {
  */
 export class Renderer {
   private frameBuf: GPUBuffer;
+  private waveBuf: GPUBuffer;
+  private waves = new OceanWaves();
   private cloudFrameBuf: GPUBuffer;
   private frameData = new Float32Array(FRAME_FLOATS);
   private expoBuf: GPUBuffer;
@@ -111,6 +118,7 @@ export class Renderer {
     const U = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
     this.frameBuf = device.createBuffer({ size: FRAME_FLOATS * 4, usage: U });
     this.cloudFrameBuf = device.createBuffer({ size: FRAME_FLOATS * 4, usage: U });
+    this.waveBuf = device.createBuffer({ size: this.waves.data.byteLength, usage: U });
     this.expoBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
 
     const fs = (label: string, code: string, format: GPUTextureFormat) => {
@@ -249,6 +257,7 @@ export class Renderer {
         { binding: 15, resource: { buffer: c.uniform } },
         { binding: 16, resource: c.samplerRepeat },
         { binding: 17, resource: this.mwTex.createView() },
+        { binding: 21, resource: { buffer: this.waveBuf } },
       ],
     }));
     if (this.stars) {
@@ -340,6 +349,7 @@ export class Renderer {
     f.set([m[3], m[4], m[5], sc.scotopic ? 1 : 0], 60);
     f.set([m[6], m[7], m[8], sc.milkyWayScale], 64);
     f.set([sc.surface, sc.windSpeed, sc.windAngle, cam.heightM], 68);
+    f.set([sc.sunDistScale, s.glare ? 1 : 0, 0, 0], 72);
     return f;
   }
 
@@ -350,6 +360,8 @@ export class Renderer {
     this.frameData = this.packFrame(cam, s, sc, dtReal, timeSec, this.width, this.height);
     device.queue.writeBuffer(this.frameBuf, 0, this.frameData);
     device.queue.writeBuffer(this.cloudFrameBuf, 0, this.packFrame(cam, s, sc, dtReal, timeSec, this.cw, this.ch));
+    // 海の波：位相を実時間で積分（早送りしても波は実時間で動く）
+    device.queue.writeBuffer(this.waveBuf, 0, this.waves.update(dtReal, sc.windSpeed));
 
     const enc = device.createCommandEncoder();
     const fullscreen = (view: GPUTextureView, pipe: GPURenderPipeline, bg: GPUBindGroup, timerName: string, clear: number[]) => {
