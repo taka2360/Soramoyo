@@ -18,7 +18,7 @@ struct Frame {
   eqX: vec3f, nightGlow: f32,              // J2000 → ENU 行列の行0、大気光の天頂輝度 [cd/m²]
   eqY: vec3f, scotopic: f32,               // 行1、暗所視の表現（0/1）
   eqZ: vec3f, mwScale: f32,                // 行2、天の川の明るさの倍率
-  pad8: vec4f,
+  surface: f32, windSpeed: f32, windAngle: f32, camHeightM: f32, // 地面の種類（0=陸, 1=海）、海上の風速 [m/s]・風向（風が吹いていく向き, rad, 東から反時計回り）、視点の地表からの高さ [m]
 };
 
 struct VsOut {

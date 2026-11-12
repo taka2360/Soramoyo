@@ -27,6 +27,10 @@ async function main(): Promise<void> {
   const cs: CloudSettings = { dropletsPerCc: 300, detail: 1, maxDistKm: 120, stepScale: 0.015, minStepM: 40, maxSteps: 320, shaftSamples: 24, detailHQ: true };
   const atmoSettings = { ...DEFAULT_ATMOSPHERE };
   const lutOpt: PrecomputeOptions = { wavelengthGroups: 8, scatteringOrders: 6 };
+  // 地面の種類。「自動」は雲シミュレーションの状態（海上のケースか）に合わせる
+  const ground = { type: '自動' as '自動' | '海' | '陸', windMs: 7, windFromSim: true };
+  /** 海の平均の反射率（直達光の照り返し・空の映り込み・水中からの散乱を合わせた値, Payne 1972 などで ~0.06） */
+  const OCEAN_ALBEDO = 0.06;
 
   const atmo = new AtmosphereLut(gpu.device, gpu.hasFloat32Filterable);
   const cloudVol = new CloudVolume(gpu.device);
@@ -53,12 +57,16 @@ async function main(): Promise<void> {
   let lutStatus = '';
   let lutBusy = false;
   let lutDirty = true;
+  const isOcean = () => ground.type === '海' || (ground.type === '自動' && !!sim.model && sim.scenario.includes('海'));
+  // 大気の多重散乱・雲の照り返しに使う地面の平均反射率
+  const effAlbedo = () => (isOcean() ? OCEAN_ALBEDO : atmoSettings.groundAlbedo);
+  let lastOcean: boolean | null = null;
   const recompute = async () => {
     if (lutBusy) { lutDirty = true; return; }
     lutBusy = true;
     lutDirty = false;
     try {
-      await atmo.precompute(atmoSettings, lutOpt, (p) => (lutStatus = `大気 LUT 計算中 ${(p * 100).toFixed(0)}%`));
+      await atmo.precompute({ ...atmoSettings, groundAlbedo: effAlbedo() }, lutOpt, (p) => (lutStatus = `大気 LUT 計算中 ${(p * 100).toFixed(0)}%`));
       lutStatus = `大気 LUT ${lutOpt.wavelengthGroups * 3}波長・${lutOpt.scatteringOrders}次散乱 ${(atmo.lastPrecomputeMs / 1000).toFixed(1)}秒`;
     } finally {
       lutBusy = false;
@@ -104,12 +112,17 @@ async function main(): Promise<void> {
   fn.add(night, 'milkyWay', 0, 3, 0.05).name('天の川の明るさ（倍）');
   fn.add(night, 'scotopic').name('暗所視（夜の色の見え方）');
   fn.close();
+  const fg = panel.gui.addFolder('地面');
+  fg.add(ground, 'type', ['自動', '海', '陸']).name('地面の種類（自動＝雲の状態に合わせる）');
+  fg.add(ground, 'windMs', 0, 25, 0.5).name('海上の風速 [m/s]');
+  fg.add(ground, 'windFromSim').name('風速・風向を雲の計算から');
+  fg.close();
   const skewT = new SkewT(document.body);
   const skewUi = { show: false };
   fs.add(skewUi, 'show').name('Skew-T 図を表示').onChange((v: boolean) => skewT.setVisible(v));
 
   // 開発・検証用（コンソールから時刻や視線を操作する）
-  (window as unknown as { __sora: unknown }).__sora = { clock, obs, cam, rs, cs, atmoSettings, lutOpt, recompute, renderer, sim, cloudVol, simUi, quality, applyQuality: (n: string) => applyQuality(n, rs, cs, sim) };
+  (window as unknown as { __sora: unknown }).__sora = { ground, clock, obs, cam, rs, cs, atmoSettings, lutOpt, recompute, renderer, sim, cloudVol, simUi, quality, applyQuality: (n: string) => applyQuality(n, rs, cs, sim) };
 
   let last = performance.now();
   let fps = 60;
@@ -154,15 +167,27 @@ async function main(): Promise<void> {
     simStatus = sim.catchUpTarget !== null ? `追いつき中（あと ${((sim.catchUpTarget - sim.simUtc) / 3600_000).toFixed(1)} 時間）` : '';
 
     const eph = computeEphemeris(clock.julianDayUT, obs, obs.elevationM + cam.heightM);
+    const ocean = isOcean();
+    if (ocean !== lastOcean) {
+      if (lastOcean !== null) recompute(); // 平均反射率が変わるので大気 LUT を作り直す
+      lastOcean = ocean;
+    }
+    // 海上の風：雲の計算の座標系の移動速度（≒下層の平均風）を使う
+    const wv = sim.model ? sim.windVec : [0, 0];
+    const wSim = Math.hypot(wv[0], wv[1]);
+    const useSimWind = ground.windFromSim && wSim > 0.5;
+    if (useSimWind) ground.windMs = Math.round(wSim * 2) / 2;
+    const windAngle = useSimWind ? Math.atan2(wv[1], wv[0]) : 0.4;
     const histAlpha = renderer.taaAlpha; // 時間方向の蓄積は renderer の再投影パスで行う
     const lightDir = eph.sunDir[2] < -0.1 ? eph.moonDir : eph.sunDir; // 雲の影を作る主光源（renderer と同じ判定）
-    cloudVol.writeUniform(sim.origin, lightDir, sim.model?.time ?? 0, cs, atmoSettings.groundAlbedo, histAlpha);
+    cloudVol.writeUniform(sim.origin, lightDir, sim.model?.time ?? 0, cs, effAlbedo(), histAlpha);
     if (sim.model && !sim.busy) cloudVol.update();
     renderer.render(
       cam,
       rs,
       {
         ...eph, groundElevationM: obs.elevationM, groundAlbedo: atmoSettings.groundAlbedo,
+        surface: ocean ? 1 : 0, windSpeed: ground.windMs, windAngle,
         lightPollution: lpZenith(), nightGlow: night.nightGlow, milkyWayScale: night.milkyWay, scotopic: night.scotopic,
       },
       dtReal,

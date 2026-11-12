@@ -114,6 +114,150 @@ fn moonDisk(dTrue: vec3f, angM: f32) -> vec3f {
   return lit + es;
 }
 
+// ---------------------------------------------------------------- 地面：海と陸
+fn hash11(n: f32) -> f32 { return fract(sin(n * 12.9898 + 4.1414) * 43758.5453); }
+fn hash21(p: vec2f) -> f32 { return fract(sin(dot(p, vec2f(127.1, 311.7))) * 43758.5453); }
+
+// 画素の地表での大きさ [m]（視線に横向きの幅。視線方向には 1/cos だけ伸びる）
+fn groundFootprint(tKm: f32) -> f32 {
+  return tKm * 1000.0 * 2.0 * F.tanHalfFov / F.resolution.y;
+}
+
+// 海面の波：分散関係 ω = √(gk) で進む正弦波の重ね合わせ（風下 ±60° に散らす）。
+// 傾斜の分散の合計は Cox & Munk (1954) の観測式 σ² = 0.003 + 5.12×10⁻³ U に合わせ、
+// 波長の帯ごとに等しく配る（傾斜のスペクトルは波数の対数あたりおおむね一定）。
+// 画素より細かい波は形として描かず、その分の傾斜の分散を微小面の粗さ（Beckmann 分布）に回す。
+// → 近くでは波の形とまばらなきらめき、遠くでは統計的に正しい太陽の照り返しの帯になる。
+const N_WAVES: i32 = 64;
+struct Waves { slope: vec2f, roughVar: f32 };
+// fpAcross：視線に横向きの画素の幅 [m]、hv：視線の水平成分の向き、cosV：視線と鉛直のなす角の余弦
+fn oceanWaves(xy: vec2f, t: f32, fpAcross: f32, hv: vec2f, cosV: f32) -> Waves {
+  let U = max(F.windSpeed, 0.5);
+  let total = 0.003 + 5.12e-3 * U;
+  let band = total / f32(N_WAVES);
+  let lMin = 0.02;
+  let lMax = max(4.0, 0.83 * U * U); // Pierson–Moskowitz のピーク波長 ≈ 2πU² / (0.877² g)
+  var s = vec2f(0.0);
+  var res = 0.0;
+  for (var i = 0; i < N_WAVES; i++) {
+    let fi = f32(i);
+    let lam = lMin * pow(lMax / lMin, (fi + hash11(fi * 3.1)) / f32(N_WAVES));
+    let a = F.windAngle + (hash11(fi * 0.917 + 7.7) - 0.5) * 2.4;
+    let d = vec2f(cos(a), sin(a));
+    // この波の進む向きに測った画素の大きさ（視線方向に進む波ほど粗く見える）
+    let dd = dot(d, hv);
+    let fp = fpAcross * sqrt(1.0 - dd * dd + dd * dd / (cosV * cosV));
+    let fade = smoothstep(4.0, 8.0, lam / fp);
+    if (fade <= 0.0) { continue; }
+    let k = 2.0 * PI / lam;
+    let ph = k * dot(d, xy) - sqrt(9.81 * k) * t + hash11(fi * 1.7 + 0.3) * 2.0 * PI;
+    s += d * (sqrt(2.0 * band) * sin(ph) * fade);
+    res += band * fade;
+  }
+  return Waves(s, max(total - res, 2e-4));
+}
+
+fn beckmannD(nh: f32, a2: f32) -> f32 {
+  let c2 = max(nh * nh, 1e-6);
+  return exp(-(1.0 - c2) / (c2 * a2)) / (PI * a2 * c2 * c2);
+}
+// Smith の遮蔽関数（Beckmann 分布, Walter et al. 2007 の有理近似）
+fn smithG1(c: f32, a2: f32) -> f32 {
+  let cc = clamp(c, 1e-4, 1.0);
+  let aa = cc / sqrt(a2 * (1.0 - cc * cc) + 1e-12);
+  if (aa >= 1.6) { return 1.0; }
+  return (3.535 * aa + 2.181 * aa * aa) / (1.0 + 2.276 * aa + 2.577 * aa * aa);
+}
+// 水（屈折率 1.33）の Fresnel 反射率（Schlick 近似）
+fn fresnelWater(c: f32) -> f32 { return 0.02 + 0.98 * pow(1.0 - clamp(c, 0.0, 1.0), 5.0); }
+
+// 光源の鏡面反射（太陽・月のきらめき）。E は光線に垂直な面での照度
+fn glint(n: vec3f, v: vec3f, l: vec3f, E: vec3f, a2: f32) -> vec3f {
+  let nl = dot(n, l);
+  let nv = dot(n, v);
+  if (nl <= 0.0 || nv <= 0.0) { return vec3f(0.0); }
+  let h = normalize(l + v);
+  let D = beckmannD(dot(n, h), a2);
+  let G = smithG1(nv, a2) * smithG1(nl, a2);
+  return E * (fresnelWater(dot(v, h)) * D * G / (4.0 * nv));
+}
+
+// 海面の輝度 [cd/m²]（大気遠近の前）。eDown = 水平面の下向き照度（太陽・天空・月）
+fn oceanRadiance(p: vec3f, view: vec3f, tKm: f32, eDown: vec3f, moonRatio: f32, sunShadow: f32) -> vec3f {
+  let up = normalize(p);
+  let v = -view;
+  let cosV = max(dot(v, up), 1e-3);
+  let hv = normalize(view.xy + vec2f(1e-6, 0.0));
+  let w = oceanWaves(p.xy * 1000.0, F.time, groundFootprint(tKm), hv, cosV);
+  var n = normalize(up - vec3f(w.slope, 0.0));
+  // 見えない側を向いた面（斜めから見るとき）は、視線に向くよう起こす
+  let nv0 = dot(n, v);
+  if (nv0 < 0.02) { n = normalize(n + v * (0.02 - nv0)); }
+  let a2 = w.roughVar;
+
+  // 空の映り込み（反射方向が水平線より下になる分は、水平線すれすれの空で代用）
+  var r = reflect(view, n);
+  let ru = dot(r, up);
+  if (ru < 0.003) { r = normalize(r + up * (0.003 - ru)); }
+  let cam = F.camPos;
+  let s = getSkyRadiance(cam, r, F.sunDir);
+  let sm = getSkyRadiance(cam, r, F.moonDir);
+  var refl = s.radiance + sm.radiance * moonRatio + lightPollution(r) + airglow(r) * s.transmittance;
+
+  // 雲の映り込み：反射方向を画面に投影して雲の描画結果を読む（画面外は端の値で代用）。
+  // 反射点と視点がほぼ同じ高さとみなせる低い視点でだけ有効なので、高い視点では弱める
+  let rf = dot(r, F.fwd);
+  let cw = (1.0 - smoothstep(300.0, 1500.0, F.camHeightM)) * smoothstep(0.02, 0.15, rf) * C.enabled;
+  if (cw > 0.0) {
+    let sx = dot(r, F.right) / rf / (F.tanHalfFov * F.aspect);
+    let sy = dot(r, F.up) / rf / F.tanHalfFov;
+    let uv = clamp(vec2f(sx * 0.5 + 0.5, 0.5 - sy * 0.5), vec2f(0.0), vec2f(1.0));
+    let cl = textureSampleLevel(cloudTex, smp, uv, 0.0);
+    refl = mix(refl, refl * cl.a + max(cl.rgb, vec3f(0.0)) / preExposure(), cw);
+  }
+
+  // 粗い面を斜めに見ると、視線に向いた面ほどよく見えるので、平均の Fresnel 反射率は鏡面より下がる
+  let Fr = fresnelWater(max(dot(n, v), 0.6 * sqrt(a2)));
+  // 水中からの散乱光（深い外洋：青で数 %、赤はほぼ 0）
+  let waterR = vec3f(0.003, 0.012, 0.028);
+  var L = refl * Fr + eDown / PI * waterR * (1.0 - Fr);
+
+  // 太陽・月のきらめき（雲の影を受ける）
+  let rp = length(p);
+  let Esun = F.sunIllum * getTransmittanceToSun(rp, dot(p, F.sunDir) / rp) * sunShadow;
+  let Emoon = F.moonIllum * getTransmittanceToSun(rp, dot(p, F.moonDir) / rp) * sunShadow;
+  L += glint(n, v, F.sunDir, Esun, a2) + glint(n, v, F.moonDir, Emoon, a2);
+
+  // 白波の被覆率（Monahan & O'Muircheartaigh 1980：W = 3.84×10⁻⁶ U^3.41）。泡の反射率は 0.5 とする
+  let wc = clamp(3.84e-6 * pow(max(F.windSpeed, 0.0), 3.41), 0.0, 0.3);
+  return mix(L, eDown / PI * 0.5, wc);
+}
+
+fn valueNoise(x: vec2f) -> f32 {
+  let i = floor(x);
+  let f = fract(x);
+  let u = f * f * (3.0 - 2.0 * f);
+  let a = hash21(i);
+  let b = hash21(i + vec2f(1.0, 0.0));
+  let c = hash21(i + vec2f(0.0, 1.0));
+  let d = hash21(i + vec2f(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+// 陸の反射率：畑・林・草地のまだら（大きさ 50 m〜3 km の模様）。画素より細かい模様は平均に溶かす
+fn landAlbedo(xy: vec2f, fp: f32) -> vec3f {
+  var v = 0.0;
+  var scale = 3000.0;
+  var amp = 0.5;
+  for (var i = 0; i < 6; i++) {
+    let fade = smoothstep(4.0, 8.0, scale / fp);
+    v += (valueNoise(xy / scale + f32(i) * 17.3) - 0.5) * amp * fade;
+    scale *= 0.5;
+    amp *= 0.8;
+  }
+  let tint = vec3f(0.92, 1.0, 0.74) / 0.968; // 植生のやや緑がかった色（輝度 1 に正規化）
+  return F.groundAlbedo * max(1.0 + 1.1 * v, 0.2) * tint;
+}
+
 @fragment
 fn fsMain(in: VsOut) -> @location(0) vec4f {
   let view = viewDir(F, in.uv);
@@ -146,7 +290,14 @@ fn fsMain(in: VsOut) -> @location(0) vec4f {
     let muM = dot(p, moon) / rp;
     let eMoon = F.moonIllum * getTransmittanceToSun(rp, muM) * max(dot(n, moon), 0.0)
               + getIrradiance(rp, muM) * moonRatio;
-    let groundL = F.groundAlbedo / PI * (e[0] + e[1] + eMoon);
+    let eDown = e[0] + e[1] + eMoon;
+    var groundL: vec3f;
+    if (F.surface > 0.5) {
+      groundL = oceanRadiance(p, view, tGround, eDown, moonRatio, cloudShadowAtGround(p));
+    } else {
+      let fp = groundFootprint(tGround) / sqrt(max(dot(-view, n), 1e-3));
+      groundL = landAlbedo(p.xy * 1000.0, fp) / PI * eDown;
+    }
     let a = getSkyRadianceToPoint(cam, p, sun);
     let am = getSkyRadianceToPoint(cam, p, moon);
     L = groundL * a.transmittance + a.radiance + am.radiance * moonRatio + lightPollution(vec3f(view.xy, 0.0)) * 0.3;

@@ -46,6 +46,8 @@ export class SimManager {
   /** 領域の原点（世界座標 m）。観測者が領域の中央に来るように始める */
   origin: [number, number] = [0, 0];
   private wind: [number, number] = [0, 0];
+  /** 計算座標系の移動速度（≒領域の平均風）[m/s] */
+  get windVec(): [number, number] { return this.wind; }
   private debt = 0;
   busy = '';
 

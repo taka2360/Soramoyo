@@ -57,6 +57,11 @@ export interface SceneState {
   nightGlow: number;
   milkyWayScale: number;
   scotopic: boolean;
+  /** 地面の種類（0 = 陸, 1 = 海） */
+  surface: number;
+  /** 海上の風速 [m/s] と風が吹いていく向き [rad, 東から反時計回り] */
+  windSpeed: number;
+  windAngle: number;
 }
 
 /**
@@ -334,6 +339,7 @@ export class Renderer {
     f.set([m[0], m[1], m[2], sc.nightGlow], 56);
     f.set([m[3], m[4], m[5], sc.scotopic ? 1 : 0], 60);
     f.set([m[6], m[7], m[8], sc.milkyWayScale], 64);
+    f.set([sc.surface, sc.windSpeed, sc.windAngle, cam.heightM], 68);
     return f;
   }
 
