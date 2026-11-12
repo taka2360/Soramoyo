@@ -330,7 +330,7 @@ export function bomex(opts: { nx: number; dx: number; dz: number }): SimCase {
   return {
     name: 'BOMEX 貿易風積雲（検証）',
     description: '海上の浅い積雲。地表フラックス・大規模強制は固定（Siebesma et al. 2003）。',
-    reference: '参照（3〜6h）：雲底≈0.5km 雲頂≈1.5〜1.8km 最大層雲量≈5〜8% LWP≈5〜12 g/m²',
+    reference: '参照（3〜6h）：雲底≈0.5km 雲層の上端≈1.5〜1.8km（時間平均の雲量の分布。画面の雲頂は瞬間の最高点なので高めに出る） 最大層雲量≈5〜8% LWP≈5〜12 g/m²',
     duration: 6 * 3600,
     config: {
       grid, base, moist: true, rain: false, smagorinsky: true, nuConst: 0, cs: 0.18, prandtl: 1 / 3,
@@ -469,7 +469,7 @@ export function dycoms(opts: { nx: number; dx: number; dzFine: number }): SimCas
   return {
     name: 'DYCOMS-II RF01 層積雲（検証）',
     description: '夜の海上の層積雲（雲海）。雲頂の放射冷却で対流が起こる。雨なし（Stevens et al. 2005）。',
-    reference: '参照（2〜4h）：雲頂≈0.85km 雲底≈0.6km 雲量≈100% LWP≈20〜60 g/m²',
+    reference: '参照（2〜4h）：雲頂≈0.85km 雲底≈0.6km（時間平均の雲量 50%。画面の雲底は瞬間の最低点） 雲量≈100% LWP≈20〜60 g/m²',
     duration: 4 * 3600,
     config: {
       grid, base, moist: true, rain: false, smagorinsky: true, nuConst: 0, cs: 0.18, prandtl: 1 / 3,

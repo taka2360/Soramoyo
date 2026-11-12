@@ -13,6 +13,7 @@ struct Col {
   ug: f32, vg: f32, wsub: f32, thLs: f32,       // 地衡風、大規模沈降 [m/s]、θ の大規模・放射強制 [K/s]
   qvLs: f32, nudge: f32, pad0: f32, pad1: f32,  // qv の大規模強制 [1/s]、基本場へのナッジング率 [1/s]
   pad2: f32, pad3: f32, pad4: f32, pad5: f32,
+  adv: array<vec4f, 6>,                          // 鉛直移流の補間の重み（計算モデル用。ここでは使わない）
 };
 
 @group(0) @binding(0) var<uniform> D: Dims;
@@ -23,24 +24,17 @@ struct Col {
 // セル中心の風（計算領域に対する相対値）[m/s]。細部合成を流れに乗せるため
 @group(0) @binding(5) var velOut: texture_storage_3d<rgba16float, write>;
 
-// 温度による相の分け方（モデルの micro.wgsl と同じ）
-fn liqFracCloud(T: f32) -> f32 { return clamp((T - 253.16) / 20.0, 0.0, 1.0); }
-fn liqFracPrecip(T: f32) -> f32 { return clamp((T - 268.16) / 15.0, 0.0, 1.0); }
-
 @compute @workgroup_size(8, 8, 1)
 fn csToVolume(@builtin(global_invocation_id) g: vec3u) {
   if (g.x >= D.nx || g.y >= D.ny || g.z >= D.nz) { return; }
   let id = g.x + D.nx * (g.y + D.ny * g.z);
   let rho = col[g.z].rho0;
-  let qn = max(st[5u * D.n + id], 0.0);
-  let qp = max(st[6u * D.n + id], 0.0);
-  let qg = max(st[7u * D.n + id], 0.0);  // あられ：消散は雨とほぼ同じ（N0 = 4×10⁵, 密度 500 で σ ≈ 3.2 ρq）
-  var wn = 1.0; var wp = 1.0;
-  if (D.ice > 0.5) {
-    let T = st[3u * D.n + id] * col[g.z].pi0;
-    wn = liqFracCloud(T);
-    wp = liqFracPrecip(T);
-  }
+  // 状態の並び：U V W TH QV QC QI QR QS QG（sim/common.wgsl）
+  let qc = max(st[5u * D.n + id], 0.0);
+  let qi = max(st[6u * D.n + id], 0.0);
+  let qr = max(st[7u * D.n + id], 0.0);
+  let qs = max(st[8u * D.n + id], 0.0);
+  let qg = max(st[9u * D.n + id], 0.0);  // あられ：消散は雨とほぼ同じ（N0 = 4×10⁵, 密度 500 で σ ≈ 3.2 ρq）
   let nu = diag[id];
   let k = rho * 1000.0;
   // セル中心の風（U は x 面 i−1/2、V は y 面 j−1/2、W は下面 k−1/2 にある。水平は周期境界）
@@ -52,5 +46,5 @@ fn csToVolume(@builtin(global_invocation_id) g: vec3u) {
   if (g.z + 1u < D.nz) { wTop = st[2u * D.n + id + D.nx * D.ny]; }
   let w = 0.5 * (st[2u * D.n + id] + wTop);
   textureStore(velOut, g, vec4f(u, v, w, 0.0));
-  textureStore(volOut, g, vec4f(qn * wn * k, qn * (1.0 - wn) * k, (qp * (wp + 5.0 * (1.0 - wp)) + qg) * k, nu));
+  textureStore(volOut, g, vec4f(qc * k, qi * k, (qr + 5.0 * qs + qg) * k, nu));
 }

@@ -1,7 +1,7 @@
 // =============================================================================
 // 雲解像モデル 共通定義
 // 格子：Arakawa C。index = i + nx*(j + ny*k)。水平は周期境界。
-// state バッファ：8 変数を連続配置 [U, V, W, TH, QV, QC, QR, QG] × n
+// state バッファ：10 変数を連続配置 [U, V, W, TH, QV, QC, QI, QR, QS, QG] × n
 //   U[i] は x 面 i-1/2、V[j] は y 面 j-1/2、W[k] は下面 k-1/2（W[k=0]=0）
 // =============================================================================
 
@@ -10,25 +10,24 @@ const F_V: u32 = 1u;
 const F_W: u32 = 2u;
 const F_TH: u32 = 3u;
 const F_QV: u32 = 4u;
-const F_QC: u32 = 5u;
-const F_QR: u32 = 6u;
-const F_QG: u32 = 7u;   // あられ・ひょう（常に氷。速く落ちる）
-const NFIELDS: u32 = 8u;
+const F_QC: u32 = 5u;   // 雲水（0℃以下でも過冷却水として残る。−40℃で凍る）
+const F_QI: u32 = 6u;   // 雲氷（氷晶。ゆっくり落ちる）
+const F_QR: u32 = 7u;   // 雨（過冷却の雨も含む）
+const F_QS: u32 = 8u;   // 雪
+const F_QG: u32 = 9u;   // あられ・ひょう（速く落ちる）
+const NFIELDS: u32 = 10u;
 
 // diag バッファ（n = 全セル数, plane = nx*ny）
-//   [0, n)              渦粘性 [m²/s]
-//   [n, n+plane)        地表の積算降水量 [kg/m²]
-//   [n+plane, +plane)   負値の切り詰めで増えた水量の累計 [kg/m²]
-//   [n+2plane, +plane)  地表面温度 Ts [K]
-//   [n+3plane, +plane)  地表の顕熱フラックス H [W/m²]
-//   [n+4plane, +plane)  地表の潜熱フラックス LE [W/m²]
-//   [n+5plane, +plane)  地表の日射 [W/m²]
-//   [n+6plane, +plane)  柱に雲水・降水・あられがあるか（1/0。微物理が書く）
-//   [n+7plane, +plane)  上を水平 ±9 列に広げたもの（ステップの最初に作る。0 の列では凝結物の移流を省く）
-//   [2n, 6n)            正値保存リミッタの係数（qv, qc, qr, qg）
-//   [6n, 7n)            三重対角ソルバの作業領域（前進消去の係数 c'）
+//   [0, n)                 渦粘性 [m²/s]
+//   [n, n+16plane)         地表の面の量（dSurf(slot)）：
+//     0 地表の積算降水量 [kg/m²]   1 負値の切り詰めで増えた水量の累計 [kg/m²]
+//     2 地表面温度 Ts [K]          3 地表の顕熱フラックス H [W/m²]   4 潜熱フラックス LE [W/m²]
+//     5 地表の日射 [W/m²]          6 柱に凝結物があるか（1/0。微物理が書く）
+//     7 上を水平 ±9 列に広げたもの（ステップの最初に作る。0 の列では凝結物の移流を省く）
+//     8 地表からの蒸発の累計 [kg/m²]   9 大規模強制（沈降・qv の強制・ナッジング）で入った水の累計 [kg/m²]
+//   [n+16plane, +6n)       正値保存リミッタの係数（qv, qc, qi, qr, qs, qg）。微物理の後は落下速度の置き場
+//   [7n+16plane, +n)       三重対角ソルバの作業領域（前進消去の係数 c'）
 const D_NU: u32 = 0u;
-const D_PRECIP: u32 = 1u;
 
 const GRAV: f32 = 9.81;
 const CP: f32 = 1004.5;
@@ -44,6 +43,8 @@ const FLAG_PD: u32 = 16u;         // 水物質の正値保存リミッタ
 const FLAG_ICE: u32 = 32u;        // 氷相（雲氷・雪）を温度で分ける
 const FLAG_LW: u32 = 64u;         // 雲の長波放射（雲頂の冷却・雲底の加熱）
 const FLAG_DYCOMS: u32 = 128u;    // DYCOMS-II の放射式の第3項（逆転層より上の沈降に伴う項）
+const FLAG_SUBS: u32 = 512u;      // 大規模沈降がある（凝結物にも沈降の移流をかける）
+const FLAG_RAD: u32 = 256u;       // 日射の計算（csRadiation：地表の日射と雲の日射加熱）をこのステップで行った
 
 struct Params {
   nx: u32, ny: u32, nz: u32, n: u32,
@@ -53,7 +54,8 @@ struct Params {
   shf: f32, lhf: f32, fcor: f32, ustar: f32,          // 固定の地表フラックス [W/m²]、コリオリ係数 [1/s]、固定 u*（0 ならバルク式）
   frameU: f32, frameV: f32, cosZen: f32, swClear: f32,  // 計算座標系の移動速度 [m/s]、太陽天頂角の余弦、晴天時の地表日射 [W/m²]
   albedo: f32, soilWet: f32, z0: f32, nDrop: f32,       // 地表アルベド、土壌の湿り（蒸発効率 β）、粗度 [m]、雲粒数濃度 [1/m³]
-  tDeep: f32, tauSoil: f32, cSoil: f32, pad0: f32,      // 深層の地温 [K]、復元時間 [s]、地表層の熱容量 [J/m²/K]
+  tDeep: f32, tauSoil: f32, cSoil: f32, lai: f32,       // 深層の地温 [K]、復元時間 [s]、地表層の熱容量 [J/m²/K]、葉面積指数
+  sunX: f32, sunY: f32, rsMin: f32, pad0: f32,          // 太陽方向の単位ベクトルの水平成分（x 東, y 北）、最小気孔抵抗 [s/m]
 };
 
 struct Col {
@@ -63,6 +65,11 @@ struct Col {
   ug: f32, vg: f32, wsub: f32, thLs: f32,       // 地衡風、大規模沈降 [m/s]、θ の大規模・放射強制 [K/s]
   qvLs: f32, nudge: f32, pad0: f32, pad1: f32,  // qv の大規模強制 [1/s]、基本場へのナッジング率 [1/s]
   pad2: f32, pad3: f32, pad4: f32, pad5: f32,
+  // 鉛直移流の補間の重み（不等間隔格子用。grid.ts の verticalAdvectionWeights）。6 点 m3..p2 に掛ける：
+  //  sA = 速度が正のときの m3..p0、sB = 負のときの m3..p0、sC = (正の p1, p2, 負の p1, p2)
+  //  s* はスカラー（と u, v）の下面 k、w* は w のセル中心 k
+  sA: vec4f, sB: vec4f, sC: vec4f,
+  wA: vec4f, wB: vec4f, wC: vec4f,
 };
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -112,11 +119,9 @@ fn qvsatIce(T: f32, p: f32) -> f32 {
 }
 
 const LS: f32 = 2.834e6; // 昇華熱
-// 温度による相の分け方（SAM: Khairoutdinov & Randall 2003 と同じ温度範囲）
-// 雲の凝結物のうち水の割合：0℃以上は水、−20℃以下は氷
-fn liqFracCloud(T: f32) -> f32 { return clamp((T - 253.16) / 20.0, 0.0, 1.0); }
-// 降水のうち雨の割合：10℃以上は雨、−5℃以下は雪
-fn liqFracPrecip(T: f32) -> f32 { return clamp((T - 268.16) / 15.0, 0.0, 1.0); }
+const LF: f32 = 3.34e5;  // 融解熱（= LS − LV）
+const T_0: f32 = 273.16; // 融点
+const T_HOM: f32 = 233.15; // 均質凍結（−40℃）
 
 // ---------------------------------------------------------------- 移流スキーム
 // 面 (a-1/2) での値。m3..p2 は a-3 .. a+2 の値、vel はその面の速度
@@ -131,6 +136,18 @@ fn interp3(m2: f32, m1: f32, p0: f32, p1: f32, vel: f32) -> f32 {
   return c4 - sign(vel) * d;
 }
 
+// 鉛直の補間（不等間隔の重み）。v0 = (m3, m2, m1, p0)、v1 = (p1, p2)
+fn zInterpS(k: i32, v0: vec4f, v1: vec2f, vel: f32) -> f32 {
+  let cl = col[k];
+  if (vel >= 0.0) { return dot(cl.sA, v0) + dot(cl.sC.xy, v1); }
+  return dot(cl.sB, v0) + dot(cl.sC.zw, v1);
+}
+fn zInterpW(kc: i32, v0: vec4f, v1: vec2f, vel: f32) -> f32 {
+  let cl = col[kc];
+  if (vel >= 0.0) { return dot(cl.wA, v0) + dot(cl.wC.xy, v1); }
+  return dot(cl.wB, v0) + dot(cl.wC.zw, v1);
+}
+
 fn spongeCoef(z: f32) -> f32 {
   if (z <= P.spongeZ || P.spongeRate <= 0.0) { return 0.0; }
   let s = sin(0.5 * 3.14159265 * (z - P.spongeZ) / (P.ztop - P.spongeZ));
@@ -138,5 +155,6 @@ fn spongeCoef(z: f32) -> f32 {
 }
 
 fn plane() -> u32 { return P.nx * P.ny; }
-fn dSurf(slot: u32, colId: u32) -> u32 { return P.n + slot * plane() + colId; } // slot: 0 降水 1 切り詰め 2 Ts 3 H 4 LE 5 SW 6 凝結物あり 7 その近傍
-fn dPd(f: u32, id: u32) -> u32 { return 2u * P.n + (f - F_QV) * P.n + id; }
+fn dSurf(slot: u32, colId: u32) -> u32 { return P.n + slot * plane() + colId; } // slot は上の diag の説明を参照
+fn dPd(f: u32, id: u32) -> u32 { return P.n + 16u * plane() + (f - F_QV) * P.n + id; }
+fn dTri(id: u32) -> u32 { return 7u * P.n + 16u * plane() + id; }

@@ -130,10 +130,101 @@ export function buildBaseState(grid: Grid, snd: Sounding): BaseState {
 }
 
 /** column バッファの1層あたりの要素数（common.wgsl の Col と一致させる） */
-export const COL_STRIDE = 24;
+export const COL_STRIDE = 48;
+
+/**
+ * 有限体積の再構成の重み（不等間隔格子）。セル s0..s0+m−1（境界 e[0..m]）の平均値から、
+ * 境界 xf での値を多項式で再構成する。セル平均の累積関数 A(e_i) を補間した多項式の微分を xf で取る。
+ * 戻り値はセルごとの重み（和は 1）。等間隔なら 5 次風上は (2, −13, 47, 27, −3)/60 になる。
+ */
+export function fvWeights(e: number[], xf: number): number[] {
+  const m = e.length - 1;
+  // L_i'(xf)：Lagrange 基底（節点 e[0..m]）の微分
+  const dL = (i: number): number => {
+    let s = 0;
+    for (let j = 0; j <= m; j++) {
+      if (j === i) continue;
+      let p = 1 / (e[i] - e[j]);
+      for (let l = 0; l <= m; l++) {
+        if (l === i || l === j) continue;
+        p *= (xf - e[l]) / (e[i] - e[l]);
+      }
+      s += p;
+    }
+    return s;
+  };
+  const d = Array.from({ length: m + 1 }, (_, i) => dL(i));
+  const w: number[] = [];
+  for (let l = 0; l < m; l++) {
+    let s = 0;
+    for (let i = l + 1; i <= m; i++) s += d[i];
+    w.push((e[l + 1] - e[l]) * s);
+  }
+  return w;
+}
+
+/**
+ * 鉛直移流の補間の重み（不等間隔格子でも次数を保つ）。各面について、6 点 m3..p2 の値に掛ける
+ * 重みを、速度が正（下から上へ）のとき wp・負のとき wn として返す。使う点の範囲と次数は従来と同じ：
+ *  5 次風上（端から 3 つ目以降）、3 次風上（2 つ目）、2 次中心（端）。
+ *  scalar：面 k（セル k−1 と k の間）。m3..p2 = セル k−3..k+2
+ *  w     ：セル中心 kc（w[kc] と w[kc+1] の間）。m3..p2 = w[kc−2..kc+3]（w の「セル」は zc[k−1]〜zc[k]）
+ */
+export function verticalAdvectionWeights(grid: Grid): { scalar: number[][]; w: number[][] } {
+  const nz = grid.nz;
+  const pick = (e: number[], first: number, cells: number[], xf: number, offset: number) => {
+    // cells は stencil のセル番号、first は m3 に当たる番号。e(c) はセル c の下端
+    const edges = cells.map((c) => e[c]).concat([e[cells[cells.length - 1] + 1]]);
+    const wt = fvWeights(edges, xf);
+    const out = [0, 0, 0, 0, 0, 0];
+    cells.forEach((c, l) => (out[c - first + offset] += wt[l]));
+    return out;
+  };
+  const range = (a: number, b: number) => Array.from({ length: b - a + 1 }, (_, i) => a + i);
+  const scalar: number[][] = [];
+  const zf = grid.zf;
+  for (let k = 0; k < nz; k++) {
+    const first = k - 3;
+    let wp = [0, 0, 0, 0, 0, 0], wn = [0, 0, 0, 0, 0, 0];
+    if (k >= 3 && k <= nz - 3) {
+      wp = pick(zf, first, range(k - 3, k + 1), zf[k], 0);
+      wn = pick(zf, first, range(k - 2, k + 2), zf[k], 0);
+    } else if (k >= 2 && k <= nz - 2) {
+      wp = pick(zf, first, range(k - 2, k), zf[k], 0);
+      wn = pick(zf, first, range(k - 1, k + 1), zf[k], 0);
+    } else if (k >= 1) {
+      wp = [0, 0, 0.5, 0.5, 0, 0];
+      wn = [0, 0, 0.5, 0.5, 0, 0];
+    }
+    scalar.push([...wp, ...wn]);
+  }
+  // w のセル：w[k] は ew[k]..ew[k+1]（ew = [0, zc0, zc1, …, zc_{nz−1}, ztop]）
+  const ew = [0, ...grid.zc, grid.ztop];
+  const w: number[][] = [];
+  for (let kc = 0; kc < nz; kc++) {
+    const first = kc - 2;
+    let wp = [0, 0, 0, 0, 0, 0], wn = [0, 0, 0, 0, 0, 0];
+    const xf = grid.zc[kc];
+    if (kc - 2 >= 0 && kc + 3 <= nz) {
+      wp = pick(ew, first, range(kc - 2, kc + 2), xf, 0);
+      wn = pick(ew, first, range(kc - 1, kc + 3), xf, 0);
+    } else if (kc - 1 >= 0 && kc + 2 <= nz) {
+      wp = pick(ew, first, range(kc - 1, kc + 1), xf, 0);
+      wn = pick(ew, first, range(kc, kc + 2), xf, 0);
+    } else {
+      wp = [0, 0, 0.5, 0.5, 0, 0];
+      wn = [0, 0, 0.5, 0.5, 0, 0];
+    }
+    w.push([...wp, ...wn]);
+  }
+  return { scalar, w };
+}
 
 export function packColumn(grid: Grid, b: BaseState, f: LargeScaleForcing = NO_FORCING): Float32Array<ArrayBuffer> {
   const a = new Float32Array(grid.nz * COL_STRIDE);
+  const adv = verticalAdvectionWeights(grid);
+  // WGSL 側は vec4 ×3 ずつ：(wp0..3), (wn0..3), (wp4, wp5, wn4, wn5)
+  const pack6 = (x: number[]) => [x[0], x[1], x[2], x[3], x[6], x[7], x[8], x[9], x[4], x[5], x[10], x[11]];
   for (let k = 0; k < grid.nz; k++) {
     a.set(
       [
@@ -143,6 +234,8 @@ export function packColumn(grid: Grid, b: BaseState, f: LargeScaleForcing = NO_F
         f.ug(grid.zc[k]), f.vg(grid.zc[k]), f.wsub(grid.zf[k]), f.thLs(grid.zc[k]),
         f.qvLs(grid.zc[k]), f.nudge(grid.zc[k]), 0, 0,
         0, 0, 0, 0,
+        ...pack6(adv.scalar[k]),
+        ...pack6(adv.w[k]),
       ],
       k * COL_STRIDE,
     );

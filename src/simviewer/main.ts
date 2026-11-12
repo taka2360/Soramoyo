@@ -4,7 +4,7 @@
 import GUI from 'lil-gui';
 import { initGpu, showFatal } from '../core/gpu';
 import { CloudModel, F } from '../sim/model';
-import { type SimCase, straka, bryanFritsch, weismanKlemp, armCumulus, bomex, dycoms } from '../sim/cases';
+import { type SimCase, straka, bryanFritsch, weismanKlemp, armCumulus, bomex, dycoms, landDay } from '../sim/cases';
 import vizWgsl from '../shaders/sim/viz.wgsl?raw';
 
 const CASES: Record<string, () => SimCase> = {
@@ -14,12 +14,32 @@ const CASES: Record<string, () => SimCase> = {
   'Weisman–Klemp 積乱雲 (3D, 128², dx=500m)': () => weismanKlemp({ nx: 128, dx: 500, dzMin: 250, shear: 10, qv0: 0.014 }),
   'Weisman–Klemp 積乱雲 (3D, 256², dx=250m)': () => weismanKlemp({ nx: 256, dx: 250, dzMin: 150, shear: 10, qv0: 0.014 }),
   'DYCOMS-II 層積雲 (3D, 64², dx=50m, dz=10m)': () => dycoms({ nx: 64, dx: 50, dzFine: 10 }),
+  'DYCOMS-II 層積雲 (3D, 64², dx=50m, dz=5m)': () => dycoms({ nx: 64, dx: 50, dzFine: 5 }),
   'DYCOMS-II 層積雲 (3D, 128², dx=50m, dz=5m)': () => dycoms({ nx: 128, dx: 50, dzFine: 5 }),
   'BOMEX 貿易風積雲 (3D, 64², dx=100m)': () => bomex({ nx: 64, dx: 100, dz: 40 }),
   'BOMEX 貿易風積雲 (3D, 128², dx=100m)': () => bomex({ nx: 128, dx: 100, dz: 40 }),
   '晴天積雲 ARM SGP (3D, 128², dx=100m)': () => armCumulus({ nx: 128, dx: 100, dzMin: 40, shf: 120, lhf: 400 }),
   '晴天積雲 ARM SGP (3D, 256², dx=100m)': () => armCumulus({ nx: 256, dx: 100, dzMin: 40, shf: 120, lhf: 400 }),
+  '陸上の一日 ARM SGP 6/21（日射と結合, 128², dx=100m）': () => landDay({
+    name: '陸上の一日（ARM SGP 6/21）', description: '夜明けから。日射・地表エネルギー収支と結合（北緯 36.6°、夏至）。',
+    sounding: 'arm', nx: 128, dx: 100, dzMin: 40, ztop: 6000, soilWet: 0.8, windMs: 8, latDeg: DIURNAL_LAT,
+  }),
+  '蒸し暑く不安定な日（日射と結合, 128², dx=500m）': () => landDay({
+    name: '蒸し暑く不安定な日', description: '夜明けから。条件付き不安定（Weisman–Klemp 型）。',
+    sounding: 'wk', nx: 128, dx: 500, dzMin: 100, ztop: 16000, soilWet: 1.0, windMs: 4, latDeg: DIURNAL_LAT,
+  }),
 };
+
+/** 日変化のケースの観測地点（ARM SGP の中央施設）と日付（夏至） */
+const DIURNAL_LAT = 36.6;
+/** 現地太陽時 hour の太陽方向（東, 北, 上）。夏至の赤緯で近似 */
+function sunAt(hour: number): [number, number, number] {
+  const d = (23.44 * Math.PI) / 180, phi = (DIURNAL_LAT * Math.PI) / 180, h = ((hour - 12) * 15 * Math.PI) / 180;
+  const up = Math.sin(phi) * Math.sin(d) + Math.cos(phi) * Math.cos(d) * Math.cos(h);
+  const east = -Math.cos(d) * Math.sin(h);
+  const north = Math.cos(phi) * Math.sin(d) - Math.sin(phi) * Math.cos(d) * Math.cos(h);
+  return [east, north, up];
+}
 
 interface FieldDef { name: string; f: number; cmap: 0 | 1; range: [number, number] }
 const FIELDS: Record<string, FieldDef> = {
@@ -28,7 +48,9 @@ const FIELDS: Record<string, FieldDef> = {
   'u [m/s]': { name: 'u', f: F.U, cmap: 0, range: [-20, 20] },
   "qv' [kg/kg]": { name: "qv'", f: F.QV, cmap: 0, range: [-0.004, 0.004] },
   'qc 雲水 [kg/kg]': { name: 'qc', f: F.QC, cmap: 1, range: [0, 0.004] },
+  'qi 雲氷 [kg/kg]': { name: 'qi', f: F.QI, cmap: 1, range: [0, 0.001] },
   'qr 雨水 [kg/kg]': { name: 'qr', f: F.QR, cmap: 1, range: [0, 0.006] },
+  'qs 雪 [kg/kg]': { name: 'qs', f: F.QS, cmap: 1, range: [0, 0.003] },
   'qg あられ [kg/kg]': { name: 'qg', f: F.QG, cmap: 1, range: [0, 0.006] },
 };
 
@@ -118,6 +140,13 @@ async function main() {
       const t0 = performance.now();
       // 終了時刻をまたがないよう、残り時間を目安にステップ数を減らす
       const remain = Math.ceil((limit - model.time) / Math.max(model.dt, 1e-3));
+      if (simCase.diurnal) {
+        const [e, nn, up] = sunAt(simCase.diurnal.startHour + model.time / 3600);
+        model.env.cosZen = up;
+        model.env.sunX = e;
+        model.env.sunY = nn;
+        model.env.swClear = up > 0 ? 1098 * up * Math.exp(-0.057 / up) : 0; // Haurwitz の晴天日射（本体と同じ）
+      }
       model.step(Math.max(1, Math.min(ui.stepsPerFrame, remain)));
       await device.queue.onSubmittedWorkDone();
       const ms = (performance.now() - t0) / ui.stepsPerFrame;
@@ -195,16 +224,18 @@ async function main() {
     hud.textContent =
       `${simCase.name}\n${simCase.description}\n` +
       `格子 ${g.nx}×${g.ny}×${g.nz} = ${(cells / 1e6).toFixed(2)}M セル  dx=${g.dx.toFixed(0)}m  dz=${Math.min(...g.dzc).toFixed(0)}〜${Math.max(...g.dzc).toFixed(0)}m  上端 ${(g.ztop / 1000).toFixed(1)}km\n` +
+      (simCase.diurnal ? `現地太陽時 ${(simCase.diurnal.startHour + model.time / 3600).toFixed(2)} 時
+` : '') +
       `時刻 ${model.time.toFixed(1)} s / ${simCase.duration} s   ステップ ${model.steps}   dt ${model.dt.toFixed(2)} s\n` +
       `計算 ${msPerStep.toFixed(2)} ms/step  → 実時間の ×${realtime.toFixed(0)}（描画なし換算）\n` +
       (st
         ? `w 最大 ${fmt(st.maxW)} / 最小 ${fmt(st.minW)} m/s   |u| 最大 ${fmt(st.maxU)} m/s\n` +
           `θ' 最小 ${fmt(st.minThp, 2)} / 最大 ${fmt(st.maxThp, 2)} K\n` +
           (simCase.config.moist
-            ? `qc 最大 ${fmt(st.maxQc * 1000, 2)} g/kg  qr 最大 ${fmt(st.maxQr * 1000, 2)} g/kg   雲底 ${fmt(st.cloudBase === null ? null : st.cloudBase / 1000, 2)} km  雲頂 ${fmt(st.cloudTop === null ? null : st.cloudTop / 1000, 2)} km  最大雲量 ${(st.cloudCover * 100).toFixed(1)}%\n` +
-              `水の収支：全水量の変化 ${(model.waterDrift * 100).toExponential(2)} %${simCase.config.forcing ? '（大規模強制で水が出入りするため保存量ではない）' : ''}   地表降水 ${(st.precip / 1e6).toFixed(3)} kt   負値切り詰め ${(st.clipped / 1e6).toExponential(2)} kt\n`
+            ? `雲水＋雲氷 最大 ${fmt(st.maxQc * 1000, 2)} g/kg  降水 最大 ${fmt(st.maxQr * 1000, 2)} g/kg   雲底 ${fmt(st.cloudBase === null ? null : st.cloudBase / 1000, 2)} km  雲頂 ${fmt(st.cloudTop === null ? null : st.cloudTop / 1000, 2)} km  最大雲量 ${(st.cloudCover * 100).toFixed(1)}%\n` +
+              `水の収支：全水量の変化 ${(model.waterDrift * 100).toExponential(2)} %（地表の蒸発・大規模強制の出入りを差し引き）   地表降水 ${(st.precip / 1e6).toFixed(3)} kt   負値切り詰め ${(st.clipped / 1e6).toExponential(2)} kt\n`
             : '') +
-          `液水温位の平均 ${st.meanThl.toFixed(5)} K   LWP ${st.lwp.toFixed(1)} g/m²   最大の層雲量 ${(st.cloudCover * 100).toFixed(1)}%\n` +
+          `氷・液水温位の平均 ${st.meanThl.toFixed(5)} K   LWP ${st.lwp.toFixed(1)} g/m²  IWP ${st.iwp.toFixed(1)} g/m²   最大の層雲量 ${(st.cloudCover * 100).toFixed(1)}%\n` +
           `地表：Ts ${(st.surface.ts - 273.15).toFixed(1)}℃  顕熱 ${st.surface.h.toFixed(0)} W/m²  潜熱 ${st.surface.le.toFixed(0)} W/m²  日射 ${st.surface.sw.toFixed(0)} W/m²\n` +
           (simCase.reference ? `${simCase.reference}\n` : '')
         : '') +

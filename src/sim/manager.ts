@@ -4,19 +4,19 @@ import { type SimCase, weismanKlemp, bomex, landDay, dycoms } from './cases';
 export const SCENARIOS: Record<string, (latDeg: number) => SimCase> = {
   '夏の晴れた日・陸上（128², 100m）': (lat) => landDay({
     name: '夏の晴れた日（陸上）', description: '米国中部の夏の朝のサウンディング（ARM SGP）。日射で地面が温まり、昼前から積雲が湧く。',
-    sounding: 'arm', nx: 128, dx: 100, dzMin: 40, ztop: 6000, soilWet: 0.35, windMs: 8, latDeg: lat,
+    sounding: 'arm', nx: 128, dx: 100, dzMin: 40, ztop: 6000, soilWet: 0.8, windMs: 8, latDeg: lat,
   }),
   '夏の晴れた日・陸上（256², 100m）': (lat) => landDay({
     name: '夏の晴れた日（陸上・高解像度）', description: '同上、領域 25.6 km。',
-    sounding: 'arm', nx: 256, dx: 100, dzMin: 40, ztop: 6000, soilWet: 0.35, windMs: 8, latDeg: lat,
+    sounding: 'arm', nx: 256, dx: 100, dzMin: 40, ztop: 6000, soilWet: 0.8, windMs: 8, latDeg: lat,
   }),
   '乾いた高気圧の日（128², 100m）': (lat) => landDay({
     name: '乾いた高気圧の日', description: '同じ気温で水蒸気が 6 割。混合層は育つが雲はほとんどできない。',
-    sounding: 'armDry', nx: 128, dx: 100, dzMin: 40, ztop: 6000, soilWet: 0.2, windMs: 5, latDeg: lat,
+    sounding: 'armDry', nx: 128, dx: 100, dzMin: 40, ztop: 6000, soilWet: 0.35, windMs: 5, latDeg: lat,
   }),
   '蒸し暑く不安定な日（256², 250m）': (lat) => landDay({
     name: '蒸し暑く不安定な日', description: '条件付き不安定（Weisman–Klemp 型）。午後に積乱雲が立つことがある。',
-    sounding: 'wk', nx: 256, dx: 250, dzMin: 80, ztop: 16000, soilWet: 0.5, windMs: 4, latDeg: lat,
+    sounding: 'wk', nx: 256, dx: 250, dzMin: 80, ztop: 16000, soilWet: 1.0, windMs: 4, latDeg: lat,
   }),
   '貿易風の海（BOMEX, 128², 100m）': () => bomex({ nx: 128, dx: 100, dz: 40 }),
   '海上の層積雲・雲海（DYCOMS-II, 128², 50m）': () => dycoms({ nx: 128, dx: 50, dzFine: 10 }),

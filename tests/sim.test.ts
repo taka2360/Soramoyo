@@ -29,3 +29,36 @@ describe('格子と基本場', () => {
     for (let k = 1; k < g.nz; k++) expect(b.rho0[k]).toBeLessThan(b.rho0[k - 1]);
   });
 });
+
+describe('不等間隔格子の移流の重み', () => {
+  it('等間隔なら従来の 5 次・3 次風上の重みと一致する', async () => {
+    const { verticalAdvectionWeights } = await import('../src/sim/grid');
+    const g = makeGrid({ nx: 2, ny: 1, dx: 100, dy: 100, zf: uniformLevels(20, 50) });
+    const a = verticalAdvectionWeights(g);
+    const s5 = a.scalar[10];
+    [2, -13, 47, 27, -3, 0].forEach((v, i) => expect(s5[i]).toBeCloseTo(v / 60, 10));
+    [0, -3, 27, 47, -13, 2].forEach((v, i) => expect(s5[6 + i]).toBeCloseTo(v / 60, 10));
+    const s3 = a.scalar[2];
+    [0, -1, 5, 2, 0, 0].forEach((v, i) => expect(s3[i]).toBeCloseTo(v / 6, 10));
+    const w5 = a.w[10];
+    [2, -13, 47, 27, -3, 0].forEach((v, i) => expect(w5[i]).toBeCloseTo(v / 60, 10));
+  });
+  it('不等間隔でも 4 次までの多項式のセル平均から面の値を正確に再構成する', async () => {
+    const { verticalAdvectionWeights } = await import('../src/sim/grid');
+    const g = makeGrid({ nx: 2, ny: 1, dx: 100, dy: 100, zf: stretchedLevels(20, 100, 1.1, 300, 3000) });
+    const a = verticalAdvectionWeights(g);
+    const f = (z: number) => 1 + 2e-3 * z - 3e-6 * z * z + 1e-9 * z ** 3 + 2e-13 * z ** 4;
+    const F = (z: number) => z + 1e-3 * z * z - 1e-6 * z ** 3 + 2.5e-10 * z ** 4 + 4e-14 * z ** 5;
+    const avg = (k: number) => (F(g.zf[k + 1]) - F(g.zf[k])) / g.dzc[k];
+    for (const k of [5, 12, 20]) {
+      let vp = 0, vn = 0;
+      for (let l = 0; l < 6; l++) {
+        const c = Math.min(g.nz - 1, Math.max(0, k - 3 + l));
+        vp += a.scalar[k][l] * avg(c);
+        vn += a.scalar[k][6 + l] * avg(c);
+      }
+      expect(vp).toBeCloseTo(f(g.zf[k]), 8);
+      expect(vn).toBeCloseTo(f(g.zf[k]), 8);
+    }
+  });
+});

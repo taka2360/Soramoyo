@@ -4,7 +4,7 @@
 // λ は離散ラプラシアンの固有値（2−2cos θ）/Δ²。λ=0（水平平均）は φ[0]=0 で固定。
 // x 方向は実数 FFT なので kx = 0..nx/2 の列だけを解く（残りの半分は共役で、逆変換で復元する）。
 // 前進消去の係数はスレッド内の配列に持たず（ローカルメモリに溢れて遅い）、
-// d' は cplx の自分の位置に上書き、c' は diag の作業領域 [6n, 7n) に置く。
+// d' は cplx の自分の位置に上書き、c' は diag の作業領域（dTri）に置く。
 
 @compute @workgroup_size(8, 8, 1)
 fn csTridiag(@builtin(global_invocation_id) g: vec3u) {
@@ -18,7 +18,6 @@ fn csTridiag(@builtin(global_invocation_id) g: vec3u) {
 
   let plane = P.nx * P.ny;
   let base = i + P.nx * j;
-  let cpBase = 6u * P.n;
 
   var cpPrev = 0.0;
   var dpPrev = vec2f(0.0);
@@ -35,13 +34,13 @@ fn csTridiag(@builtin(global_invocation_id) g: vec3u) {
     let m = b - a * cpPrev;
     cpPrev = cc / m;
     dpPrev = (r - a * dpPrev) / m;
-    diag[cpBase + id] = cpPrev;
+    diag[dTri(id)] = cpPrev;
     cplx[id] = dpPrev;
   }
   var x = dpPrev;
   for (var kk = i32(nz) - 2; kk >= 0; kk--) {
     let id = base + plane * u32(kk);
-    x = cplx[id] - diag[cpBase + id] * x;
+    x = cplx[id] - diag[dTri(id)] * x;
     cplx[id] = x;
   }
 }

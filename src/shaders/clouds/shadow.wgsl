@@ -9,6 +9,7 @@ struct Col {
   ug: f32, vg: f32, wsub: f32, thLs: f32,       // 地衡風、大規模沈降 [m/s]、θ の大規模・放射強制 [K/s]
   qvLs: f32, nudge: f32, pad0: f32, pad1: f32,  // qv の大規模強制 [1/s]、基本場へのナッジング率 [1/s]
   pad2: f32, pad3: f32, pad4: f32, pad5: f32,
+  adv: array<vec4f, 6>,                          // 鉛直移流の補間の重み（計算モデル用。ここでは使わない）
 };
 
 @group(0) @binding(0) var<uniform> D: Dims;

@@ -164,6 +164,8 @@ async function main(): Promise<void> {
       const sunNow = computeEphemeris(2440587.5 + sim.simUtc / 86400_000, obs, obs.elevationM);
       const cz = sunNow.sunDir[2];
       sim.model.env.cosZen = cz;
+      sim.model.env.sunX = sunNow.sunDir[0];
+      sim.model.env.sunY = sunNow.sunDir[1];
       sim.model.env.swClear = cz > 0 ? 1098 * cz * Math.exp(-0.057 / cz) : 0; // Haurwitz の晴天日射
       sim.nDrop = cs.dropletsPerCc * 1e6;
       const want = dtReal * clock.effectiveSpeed;
