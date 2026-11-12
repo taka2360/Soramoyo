@@ -107,8 +107,6 @@ export class CloudModel {
   private cplx: GPUBuffer;
   private diag: GPUBuffer;
   private statsBuf: GPUBuffer;
-  private statsRead: GPUBuffer;
-  private statsBusy = false;
   private paramBuf: GPUBuffer;
   private layout: GPUBindGroupLayout;
   private pipes = new Map<string, GPUComputePipeline>();
@@ -124,6 +122,7 @@ export class CloudModel {
     if (g.nx > 1024 || g.ny > 1024) throw new Error('nx, ny は 1024 以下');
     if (g.nz > 256) throw new Error('nz は 256 以下');
     this.n = g.nx * g.ny * g.nz;
+    this.statsEvery = Math.min(32, Math.max(8, 2 ** Math.round(Math.log2(6e7 / this.n))));
     this.dt = cfg.dtMax;
     const n = this.n;
 
@@ -134,7 +133,7 @@ export class CloudModel {
     device.queue.writeBuffer(this.colBuf, 0, packColumn(g, cfg.base, cfg.forcing));
     this.cplx = device.createBuffer({ label: 'cplx', size: n * 8, usage: S });
     const plane = g.nx * g.ny;
-    this.diag = device.createBuffer({ label: 'diag', size: (6 * n + 8 * plane) * 4, usage: S });
+    this.diag = device.createBuffer({ label: 'diag', size: (7 * n + 8 * plane) * 4, usage: S });
     // 地表面温度の初期値 = 最下層の気温
     const ts0 = new Float32Array(plane).fill(cfg.base.th0[0] * cfg.base.pi0[0]);
     device.queue.writeBuffer(this.diag, (n + 2 * plane) * 4, ts0);
@@ -143,7 +142,6 @@ export class CloudModel {
     // 「柱に凝結物あり」の印は、最初の微物理までは全列 1（初期状態に雲がある場合のため）
     device.queue.writeBuffer(this.diag, (n + 6 * plane) * 4, new Float32Array(plane).fill(1));
     this.statsBuf = device.createBuffer({ label: 'stats', size: (g.nz + 1) * NSTAT * 4, usage: S });
-    this.statsRead = device.createBuffer({ size: (g.nz + 1) * NSTAT * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     this.paramBuf = device.createBuffer({ size: PARAM_SLOT * 3, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
     const st = (type: GPUBufferBindingType): GPUBindGroupLayoutEntry['buffer'] => ({ type });
@@ -167,21 +165,22 @@ export class CloudModel {
 
     const dyn = commonWgsl + dynamicsWgsl;
     for (const ep of ['csActDilate', 'csNu', 'csPdRatio', 'csScalars', 'csMomentum', 'csDivergence', 'csProject']) mk(ep, dyn, ep);
-    const fft = (N: number, dir: number, axis: number) =>
+    // MODE 0/1 = x 方向の実数 FFT（順/逆）、2 = y 方向の複素 FFT（kx = 0..nx/2 の列だけ）
+    const fft = (N: number, dir: number, mode: number) =>
       commonWgsl +
       fftWgsl
         .replaceAll('__N__', String(N))
         .replaceAll('__LOG2N__', String(Math.log2(N)))
         .replaceAll('__DIR__', dir < 0 ? '-1.0' : '1.0')
-        .replaceAll('__AXIS__', String(axis));
+        .replaceAll('__MODE__', String(mode));
     mk('fftXf', fft(g.nx, -1, 0), 'csFft');
-    mk('fftXi', fft(g.nx, 1, 0), 'csFft');
+    mk('fftXi', fft(g.nx, 1, 1), 'csFft');
     if (g.ny > 1) {
-      mk('fftYf', fft(g.ny, -1, 1), 'csFft');
-      mk('fftYi', fft(g.ny, 1, 1), 'csFft');
+      mk('fftYf', fft(g.ny, -1, 2), 'csFft');
+      mk('fftYi', fft(g.ny, 1, 2), 'csFft');
     }
     mk('tridiag', commonWgsl + tridiagWgsl, 'csTridiag');
-    mk('micro', commonWgsl + microWgsl, 'csMicro');
+    for (const ep of ['csColumnPre', 'csMicroCell', 'csSediment']) mk(ep, commonWgsl + microWgsl, ep);
     mk('stats', commonWgsl + statsWgsl, 'csStats');
 
     this.initialWater = NaN; // 最初の統計で確定
@@ -249,14 +248,35 @@ export class CloudModel {
     this.device.queue.writeBuffer(this.paramBuf, 0, buf);
   }
 
-  /** CFL 条件から次の時間刻みを決める（統計は数ステップ遅れなので余裕を持たせる） */
-  private chooseDt(): number {
-    const s = this.lastStats;
-    const g = this.cfg.grid;
-    if (!s) return Math.min(this.cfg.dtMax, 1);
-    const dzMin = Math.min(...g.dzc);
-    const rate = Math.max(s.maxU / g.dx, g.ny > 1 ? s.maxV / g.dy : 0, Math.max(s.maxW, -s.minW) / dzMin, 1e-6);
-    return Math.min(this.cfg.dtMax, this.cfg.cfl / rate);
+  /** 検証用：0 より大きければ時間刻みをこの値に固定する [s] */
+  fixedDt = 0;
+
+  /**
+   * 時間刻みの決め方（実行ごとに同じ列になるよう、読み出しのタイミングに依らない形）：
+   *  統計はステップ番号が K（statsEvery）の倍数のステップだけで集計して読み出す。
+   *  刻みはステップ s = m·K の始めにだけ決め直し、ちょうどステップ (m−1)K と (m−2)K の統計を使う。
+   *  その統計がまだ届いていなければ、新しいステップを始めずに待つ（runChunks が早めに戻る）。
+   *  読み出しは提出の次のフレームに届くので、1フレームに進められるのは少なくとも K ステップ。
+   *  K は格子が小さい（1ステップが軽く、追いつきで1フレームに多くのステップを進める）ほど大きくする（8〜32）。
+   *  統計は K〜2K−1 ステップ遅れなので、速さを2点から線形外挿し、刻みの増加も 1 回 1.2 倍までに抑える。
+   */
+  readonly statsEvery: number;
+  /** 集計したステップの番号 → そのステップの後の CFL の速さ max(|u|/dx, |v|/dy, |w|/dz) [1/s] */
+  private rates = new Map<number, number>();
+  /** 刻みを決め直したときの値（次に決め直すまで使う） */
+  private dtCur = 0;
+
+  /** ステップ s の時間刻み。必要な統計が届いていなければ null */
+  private chooseDt(s: number): number | null {
+    if (this.fixedDt > 0) return this.fixedDt;
+    const K = this.statsEvery;
+    if (s < K) return Math.min(this.cfg.dtMax, 1);
+    if (s % K !== 0) return this.dtCur;
+    const r1 = this.rates.get(s - K);
+    if (r1 === undefined) return null;
+    const r0 = this.rates.get(s - 2 * K) ?? r1;
+    const rate = Math.max(r1 + Math.max(0, r1 - r0), 1e-6);
+    return Math.min(this.cfg.dtMax, this.cfg.cfl / rate, 1.2 * this.dtCur);
   }
 
   /** 途中まで進めたステップの残りの塊（空なら次は新しいステップ）。塊 = ディスパッチの並び */
@@ -269,10 +289,16 @@ export class CloudModel {
     return this.pending.length > 0;
   }
 
-  /** 新しいステップの塊を用意する */
-  private beginStep(): void {
+  /** 新しいステップの塊を用意する。時間刻みを決める統計がまだ届いていなければ false */
+  private beginStep(): boolean {
     const g = this.cfg.grid;
-    const dt = this.chooseDt();
+    const s = this.steps;
+    const dt = this.chooseDt(s);
+    if (dt === null) return false;
+    // 使い終わった統計は捨てる
+    for (const k of this.rates.keys()) if (k < s - 2 * this.statsEvery) this.rates.delete(k);
+    if (s % this.statsEvery === 0) this.dtCur = dt;
+    this.pendingCapture = s % this.statsEvery === 0;
     this.dt = dt;
     this.pendingDt = dt;
     this.writeParams(dt);
@@ -281,6 +307,12 @@ export class CloudModel {
     const perms: [number, number, number][] = [[r, r, a], [r, a, b], [r, b, a]];
     const g3 = [Math.ceil(g.nx / 8), Math.ceil(g.ny / 8), g.nz] as const;
     const g2 = [Math.ceil(g.nx / 8), Math.ceil(g.ny / 8), 1] as const;
+    const g3z2 = [Math.ceil(g.nx / 8), Math.ceil(g.ny / 8), Math.ceil(g.nz / 2)] as const;
+    // 実数 FFT：x は線2本で1ワークグループ（fft.wgsl の XGROUPS = 32768 個ずつ折り返す）、y と三重対角は kx = 0..nx/2
+    const pairs = Math.ceil((g.ny * g.nz) / 2);
+    const fftX = [Math.min(pairs, 32768), Math.ceil(pairs / 32768), 1] as const;
+    const fftYx = Math.ceil((g.nx / 2 + 1) / Math.min(8, Math.max(1, Math.floor(2048 / g.ny))));
+    const gHalf = [Math.ceil((g.nx / 2 + 1) / 8), Math.ceil(g.ny / 8), 1] as const;
     const D = (name: string, bg: GPUBindGroup, slot: number, x: number, y = 1, z = 1): Dispatch => ({ name, bg, slot, x, y, z });
     const chunks: Dispatch[][] = [];
     perms.forEach(([nI, cI, oI], stage) => {
@@ -288,21 +320,28 @@ export class CloudModel {
       const A: Dispatch[] = [];
       if (stage === 0) A.push(D('csActDilate', bg, stage, ...g2), D('csNu', bg, stage, ...g3));
       if (stage === 2 && this.cfg.moist && this.cfg.positiveDefinite !== false) A.push(D('csPdRatio', bg, stage, ...g3));
-      A.push(D('csScalars', bg, stage, ...g3), D('csMomentum', bg, stage, ...g3), D('csDivergence', bg, stage, ...g3));
+      A.push(D('csScalars', bg, stage, ...g3z2), D('csMomentum', bg, stage, ...g3z2), D('csDivergence', bg, stage, ...g3));
       chunks.push(A);
-      const B: Dispatch[] = [D('fftXf', bg, stage, g.ny, g.nz)];
-      if (g.ny > 1) B.push(D('fftYf', bg, stage, g.nx, g.nz));
-      B.push(D('tridiag', bg, stage, ...g2));
-      if (g.ny > 1) B.push(D('fftYi', bg, stage, g.nx, g.nz));
-      B.push(D('fftXi', bg, stage, g.ny, g.nz), D('csProject', bg, stage, ...g3));
+      const B: Dispatch[] = [D('fftXf', bg, stage, ...fftX)];
+      if (g.ny > 1) B.push(D('fftYf', bg, stage, fftYx, g.nz));
+      B.push(D('tridiag', bg, stage, ...gHalf));
+      if (g.ny > 1) B.push(D('fftYi', bg, stage, fftYx, g.nz));
+      B.push(D('fftXi', bg, stage, ...fftX), D('csProject', bg, stage, Math.ceil(g.nx / 32), Math.ceil(g.ny / 2), g.nz));
       chunks.push(B);
     });
     const last = this.bind(r, b, a);
-    chunks.push([D('micro', last, 2, ...g2), D('stats', last, 2, g.nz + 1)]);
+    const fin = [D('csColumnPre', last, 2, ...g2), D('csMicroCell', last, 2, ...g3), D('csSediment', last, 2, ...g2)];
+    if (this.pendingCapture) fin.push(D('stats', last, 2, g.nz + 1));
+    chunks.push(fin);
     this.pending = chunks;
     this.pendingNext = a;
+    return true;
   }
   private pendingNext = 0;
+  /** このステップで統計を集計して読み出すか */
+  private pendingCapture = false;
+  /** 統計の読み出し用バッファ（使い終わったものを再利用） */
+  private readPool: GPUBuffer[] = [];
 
   private encode(pass: GPUComputePassEncoder, d: Dispatch): void {
     pass.setPipeline(this.pipes.get(d.name)!);
@@ -317,7 +356,8 @@ export class CloudModel {
   async profileStep(): Promise<Record<string, number>> {
     const d = this.device;
     if (!d.features.has('timestamp-query')) throw new Error('timestamp-query が使えません');
-    if (this.pending.length === 0) this.beginStep();
+    while (this.pending.length === 0 && !this.beginStep()) await new Promise((r) => setTimeout(r, 5));
+    const capture = this.pendingCapture ? { step: this.steps, time: this.time + this.pendingDt } : null;
     const list = this.pending.flat();
     this.pending = [];
     const qs = d.createQuerySet({ type: 'timestamp', count: list.length * 2 });
@@ -331,10 +371,12 @@ export class CloudModel {
     });
     enc.resolveQuerySet(qs, 0, list.length * 2, res, 0);
     enc.copyBufferToBuffer(res, 0, rd, 0, list.length * 16);
+    const sb = capture ? this.copyStats(enc) : null;
     d.queue.submit([enc.finish()]);
     this.cur = this.pendingNext;
     this.time += this.pendingDt;
     this.steps++;
+    if (capture && sb) this.readStats(sb, capture.step, capture.time);
     await rd.mapAsync(GPUMapMode.READ);
     const t = new BigInt64Array(rd.getMappedRange().slice(0));
     rd.unmap();
@@ -346,31 +388,33 @@ export class CloudModel {
 
   /**
    * 最大 maxChunks 個の塊を実行する（1つのコマンドバッファ）。ステップが完了したら時刻を進める。
+   * 時間刻みを決める統計が届いていないときは、新しいステップを始めずに早めに戻る。
    * 戻り値：使った塊の数と、進んだシミュレーション時間 [s]。
    */
-  runChunks(maxChunks: number, wantStats = true): { used: number; advanced: number } {
+  runChunks(maxChunks: number): { used: number; advanced: number } {
     const d = this.device;
     let used = 0;
     let advanced = 0;
     let enc: GPUCommandEncoder | null = null;
-    let statsCopy = false;
     while (used < maxChunks) {
-      if (this.pending.length === 0) this.beginStep();
+      if (this.pending.length === 0 && !this.beginStep()) break;
       enc ??= d.createCommandEncoder();
       const pass = enc.beginComputePass({ label: 'sim-chunk' });
       for (const x of this.pending.shift()!) this.encode(pass, x);
       pass.end();
       used++;
       if (this.pending.length === 0) {
-        // ステップ完了。統計は読み出し中でなければ写す。次のステップの書き込み先に影響しないよう、ここで一旦提出する
-        if (wantStats && !this.statsBusy) { enc.copyBufferToBuffer(this.statsBuf, 0, this.statsRead, 0, this.statsRead.size); statsCopy = true; }
+        // ステップ完了。集計したステップなら統計を写す。次のステップの書き込み先に影響しないよう、ここで一旦提出する
+        const capture = this.pendingCapture;
+        const sb = capture ? this.copyStats(enc) : null;
         d.queue.submit([enc.finish()]);
         enc = null;
+        const step = this.steps;
         this.cur = this.pendingNext;
         this.time += this.pendingDt;
         this.steps++;
         advanced += this.pendingDt;
-        if (statsCopy) { this.readStats(this.time); statsCopy = false; }
+        if (sb) this.readStats(sb, step, this.time);
       }
     }
     if (enc) d.queue.submit([enc.finish()]);
@@ -379,25 +423,33 @@ export class CloudModel {
 
   /**
    * count ステップ進める（途中のステップがあれば、まずそれを終える）。
-   * 進めたシミュレーション時間 [s] を返す。
+   * 統計待ちで進めなくなったらそこでやめる。進めたシミュレーション時間 [s] を返す。
    */
   step(count: number): number {
     let advanced = 0;
     for (let s = 0; s < count; s++) {
       const n = this.pending.length > 0 ? this.pending.length : CloudModel.CHUNKS_PER_STEP;
-      advanced += this.runChunks(n, s === count - 1).advanced;  // 統計の読み出しは最後のステップだけ（従来どおり）
+      const r = this.runChunks(n);
+      advanced += r.advanced;
+      if (r.used < n) break;
     }
     return advanced;
   }
 
-  private readStats(time: number): void {
-    this.statsBusy = true;
+  private copyStats(enc: GPUCommandEncoder): GPUBuffer {
+    const size = (this.cfg.grid.nz + 1) * NSTAT * 4;
+    const buf = this.readPool.pop() ?? this.device.createBuffer({ label: 'stats-read', size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    enc.copyBufferToBuffer(this.statsBuf, 0, buf, 0, size);
+    return buf;
+  }
+
+  private readStats(buf: GPUBuffer, step: number, time: number): void {
     const g = this.cfg.grid;
     const base = this.cfg.base;
-    this.statsRead.mapAsync(GPUMapMode.READ).then(() => {
-      const a = new Float32Array(this.statsRead.getMappedRange().slice(0));
-      this.statsRead.unmap();
-      this.statsBusy = false;
+    buf.mapAsync(GPUMapMode.READ).then(() => {
+      const a = new Float32Array(buf.getMappedRange().slice(0));
+      buf.unmap();
+      this.readPool.push(buf);
       const levels: LevelStats[] = [];
       const area = g.nx * g.dx * g.ny * g.dy;
       const cellArea = g.dx * g.dy;
@@ -444,7 +496,10 @@ export class CloudModel {
         levels, totalWater: total, airWater, precip, clipped, ...agg,
         cloudBase, cloudTop, cloudCover: cover, meanThl: thlMass / mass, lwp: lwp * 1000, surface, time,
       };
-    });
+      // 時間刻みに使う CFL の速さ
+      const dzMin = Math.min(...g.dzc);
+      this.rates.set(step, Math.max(agg.maxU / g.dx, g.ny > 1 ? agg.maxV / g.dy : 0, Math.max(agg.maxW, -agg.minW) / dzMin));
+    }).catch(() => { /* 破棄後の読み出しは無視 */ });
   }
 
   /** 全水量の初期値からの相対変化 */
@@ -456,7 +511,7 @@ export class CloudModel {
 
   destroy(): void {
     // 送信済みのコマンドが使い終わってから解放する
-    void this.device.queue.onSubmittedWorkDone().then(() => [...this.states, this.colBuf, this.cplx, this.diag, this.statsBuf, this.statsRead, this.paramBuf].forEach((b) => b.destroy()));
+    void this.device.queue.onSubmittedWorkDone().then(() => [...this.states, this.colBuf, this.cplx, this.diag, this.statsBuf, this.paramBuf, ...this.readPool].forEach((b) => b.destroy()));
   }
 }
 

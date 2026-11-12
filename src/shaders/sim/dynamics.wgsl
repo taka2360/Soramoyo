@@ -170,7 +170,7 @@ fn scalarTendency(f: u32, i: i32, j: i32, k: i32, limited: bool) -> f32 {
   return t;
 }
 
-@compute @workgroup_size(8, 8, 1)
+@compute @workgroup_size(8, 8, 2)
 fn csScalars(@builtin(global_invocation_id) g: vec3u) {
   if (g.x >= P.nx || g.y >= P.ny || g.z >= P.nz) { return; }
   let i = i32(g.x); let j = i32(g.y); let k = i32(g.z);
@@ -278,7 +278,7 @@ fn momDiff(f: u32, i: i32, j: i32, k: i32, nu: f32) -> f32 {
   return nu * d;
 }
 
-@compute @workgroup_size(8, 8, 1)
+@compute @workgroup_size(8, 8, 2)
 fn csMomentum(@builtin(global_invocation_id) g: vec3u) {
   if (g.x >= P.nx || g.y >= P.ny || g.z >= P.nz) { return; }
   let i = i32(g.x); let j = i32(g.y); let k = i32(g.z);
@@ -362,7 +362,7 @@ fn csDivergence(@builtin(global_invocation_id) g: vec3u) {
 
 fn phi(i: i32, j: i32, k: i32) -> f32 { return cplx[idx(i, j, k)].x; }
 
-@compute @workgroup_size(8, 8, 1)
+@compute @workgroup_size(32, 2, 1)
 fn csProject(@builtin(global_invocation_id) g: vec3u) {
   if (g.x >= P.nx || g.y >= P.ny || g.z >= P.nz) { return; }
   let i = i32(g.x); let j = i32(g.y); let k = i32(g.z);
