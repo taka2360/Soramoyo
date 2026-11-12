@@ -9,6 +9,14 @@ const MAXNZ: u32 = 256u;
 fn csTridiag(@builtin(global_invocation_id) g: vec3u) {
   if (g.x >= P.nx || g.y >= P.ny) { return; }
   let i = g.x; let j = g.y;
+  // 右辺は実数なので、波数 (i, j) と (−i, −j) の係数は互いに複素共役で、解も共役になる。
+  // 半分の波数だけ解き、相方には共役を書く（計算量が半分）。
+  let pi_ = (P.nx - i) % P.nx;
+  let pj = (P.ny - j) % P.ny;
+  if (i > P.nx / 2u) { return; }
+  if ((i == 0u || i == P.nx / 2u) && j > P.ny / 2u) { return; }
+  let partner = pi_ + P.nx * pj;
+  let hasPartner = partner != i + P.nx * j;
   let nz = P.nz;
   let TWO_PI = 6.283185307;
   var lam = (2.0 - 2.0 * cos(TWO_PI * f32(i) / f32(P.nx))) / (P.dx * P.dx);
@@ -40,9 +48,11 @@ fn csTridiag(@builtin(global_invocation_id) g: vec3u) {
   }
   var x = dp[nz - 1u];
   cplx[base + plane * (nz - 1u)] = x;
+  if (hasPartner) { cplx[partner + plane * (nz - 1u)] = vec2f(x.x, -x.y); }
   for (var kk = i32(nz) - 2; kk >= 0; kk--) {
     let k = u32(kk);
     x = dp[k] - cp[k] * x;
     cplx[base + plane * k] = x;
+    if (hasPartner) { cplx[partner + plane * k] = vec2f(x.x, -x.y); }
   }
 }

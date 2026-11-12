@@ -157,7 +157,9 @@ fn csMicro(@builtin(global_invocation_id) g: vec3u) {
     }
     var below = 0.0;
     var fPrev = 70.0 * exp(-qTotal) + 22.0; // 地表面での正味の上向きフラックス
-    for (var k = 0u; k < nz; k++) {
+    // 雲の無い柱はフラックスが高さによらず一定（加熱・冷却 0）なので省く（DYCOMS の第3項がある場合を除く）
+    let lwLoops = qTotal > 0.0 || zi < 1e8;
+    for (var k = 0u; k < select(0u, nz, lwLoops); k++) {
       let cl = col[k];
       below += 85.0 * cl.rho0 * so(F_QC, base + pl * k) * cl.dzc;
       let zTop = cl.zf + cl.dzc;
@@ -186,7 +188,19 @@ fn csMicro(@builtin(global_invocation_id) g: vec3u) {
     let p = cl.p0;
     let pi = cl.pi0;
 
-    if (moist) {
+    // 凝結物が無く未飽和なら相変化は起きない（飽和調整の Newton 法も元の温度に収束する）ので省く。
+    // 晴れた格子が大半なので、これで微物理の計算量が大きく減る。
+    var doMicro = moist;
+    if (moist && qn == 0.0 && qp == 0.0 && qg == 0.0) {
+      let T0 = th * pi;
+      var a0 = 1.0;
+      if (ice) { a0 = liqFracCloud(T0); }
+      var qs0 = qvsatLiq(T0, p);
+      if (a0 < 1.0) { qs0 = a0 * qs0 + (1.0 - a0) * qvsatIce(T0, p); }
+      if (qv < qs0) { doMicro = false; }
+    }
+
+    if (doMicro) {
       let T0 = th * pi;
       var wn = 1.0; var wp = 1.0;
       if (ice) { wn = liqFracCloud(T0); wp = liqFracPrecip(T0); }
@@ -298,7 +312,9 @@ fn csMicro(@builtin(global_invocation_id) g: vec3u) {
 
   // ---- 6. 降水の落下（風上差分、CFL に応じて小分け）。雨と雪の割合で落下速度を混ぜる
   var precip = 0.0;
-  if (moist && rain) {
+  var anyPrecip = false;
+  for (var k = 0u; k < nz; k++) { if (qrCol[k] > 0.0 || qgCol[k] > 0.0) { anyPrecip = true; break; } }
+  if (moist && rain && anyPrecip) {
     let rhoS = col[0].rho0;
     var vtC: array<f32, MAXNZ_M>;
     var vgC: array<f32, MAXNZ_M>;
@@ -343,10 +359,13 @@ fn csMicro(@builtin(global_invocation_id) g: vec3u) {
       precip += (fluxAbove + fluxAboveG) * dts;
     }
   }
+  var anyCond = false;
   for (var k = 0u; k < nz; k++) {
     sO[F_QR * P.n + base + pl * k] = qrCol[k];
     sO[F_QG * P.n + base + pl * k] = qgCol[k];
+    if (qrCol[k] > 0.0 || qgCol[k] > 0.0 || sO[F_QC * P.n + base + pl * k] > 0.0) { anyCond = true; }
   }
   diag[dSurf(0u, base)] += precip;
   diag[dSurf(1u, base)] += negAcc;
+  diag[dSurf(6u, base)] = select(0.0, 1.0, anyCond);
 }

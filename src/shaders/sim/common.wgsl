@@ -23,6 +23,8 @@ const NFIELDS: u32 = 8u;
 //   [n+3plane, +plane)  地表の顕熱フラックス H [W/m²]
 //   [n+4plane, +plane)  地表の潜熱フラックス LE [W/m²]
 //   [n+5plane, +plane)  地表の日射 [W/m²]
+//   [n+6plane, +plane)  柱に雲水・降水・あられがあるか（1/0。微物理が書く）
+//   [n+7plane, +plane)  上を水平 ±9 列に広げたもの（ステップの最初に作る。0 の列では凝結物の移流を省く）
 //   [2n, 6n)            正値保存リミッタの係数（qv, qc, qr, qg）
 const D_NU: u32 = 0u;
 const D_PRECIP: u32 = 1u;
@@ -71,8 +73,10 @@ struct Col {
 @group(0) @binding(6) var<storage, read_write> diag: array<f32>;
 @group(0) @binding(7) var<storage, read_write> stats: array<f32>;
 
-fn wrapX(i: i32) -> u32 { let n = i32(P.nx); return u32(((i % n) + n) % n); }
-fn wrapY(j: i32) -> u32 { let n = i32(P.ny); return u32(((j % n) + n) % n); }
+// 水平の格子数は FFT の都合で常に 2 の冪なので、周期境界はビット演算で（整数の剰余は GPU では遅い）。
+// 負の添字も 2 の補数なので u32 にしてマスクすれば正しく折り返る。ny = 1 ならマスク 0 で常に 0。
+fn wrapX(i: i32) -> u32 { return u32(i) & (P.nx - 1u); }
+fn wrapY(j: i32) -> u32 { return u32(j) & (P.ny - 1u); }
 fn clampK(k: i32) -> u32 { return u32(clamp(k, 0, i32(P.nz) - 1)); }
 
 fn idx(i: i32, j: i32, k: i32) -> u32 {
@@ -133,5 +137,5 @@ fn spongeCoef(z: f32) -> f32 {
 }
 
 fn plane() -> u32 { return P.nx * P.ny; }
-fn dSurf(slot: u32, colId: u32) -> u32 { return P.n + slot * plane() + colId; } // slot: 0 降水 1 切り詰め 2 Ts 3 H 4 LE 5 SW
+fn dSurf(slot: u32, colId: u32) -> u32 { return P.n + slot * plane() + colId; } // slot: 0 降水 1 切り詰め 2 Ts 3 H 4 LE 5 SW 6 凝結物あり 7 その近傍
 fn dPd(f: u32, id: u32) -> u32 { return 2u * P.n + (f - F_QV) * P.n + id; }

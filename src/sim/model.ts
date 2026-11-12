@@ -7,6 +7,9 @@ import statsWgsl from '../shaders/sim/stats.wgsl?raw';
 import { type Grid, type BaseState, type LargeScaleForcing, packColumn, COL_STRIDE } from './grid';
 import { LV, CP } from './thermo';
 
+/** ディスパッチ1回分（パイプライン名・バインドグループ・パラメータの段・グループ数） */
+interface Dispatch { name: string; bg: GPUBindGroup; slot: number; x: number; y: number; z: number }
+
 export const NFIELDS = 8;
 export const F = { U: 0, V: 1, W: 2, TH: 3, QV: 4, QC: 5, QR: 6, QG: 7 } as const;
 const NSTAT = 16;
@@ -137,6 +140,8 @@ export class CloudModel {
     device.queue.writeBuffer(this.diag, (n + 2 * plane) * 4, ts0);
     // 正値保存リミッタの係数の初期値（使わないときも 1 にしておく）
     device.queue.writeBuffer(this.diag, 2 * n * 4, new Float32Array(4 * n).fill(1));
+    // 「柱に凝結物あり」の印は、最初の微物理までは全列 1（初期状態に雲がある場合のため）
+    device.queue.writeBuffer(this.diag, (n + 6 * plane) * 4, new Float32Array(plane).fill(1));
     this.statsBuf = device.createBuffer({ label: 'stats', size: (g.nz + 1) * NSTAT * 4, usage: S });
     this.statsRead = device.createBuffer({ size: (g.nz + 1) * NSTAT * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     this.paramBuf = device.createBuffer({ size: PARAM_SLOT * 3, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -161,7 +166,7 @@ export class CloudModel {
       this.pipes.set(label, device.createComputePipeline({ label, layout: pl, compute: { module: device.createShaderModule({ label, code }), entryPoint } }));
 
     const dyn = commonWgsl + dynamicsWgsl;
-    for (const ep of ['csNu', 'csPdRatio', 'csScalars', 'csMomentum', 'csDivergence', 'csProject']) mk(ep, dyn, ep);
+    for (const ep of ['csActDilate', 'csNu', 'csPdRatio', 'csScalars', 'csMomentum', 'csDivergence', 'csProject']) mk(ep, dyn, ep);
     const fft = (N: number, dir: number, axis: number) =>
       commonWgsl +
       fftWgsl
@@ -254,8 +259,8 @@ export class CloudModel {
     return Math.min(this.cfg.dtMax, this.cfg.cfl / rate);
   }
 
-  /** 途中まで進めたステップの残りの塊（空なら次は新しいステップ） */
-  private pending: ((pass: GPUComputePassEncoder) => void)[] = [];
+  /** 途中まで進めたステップの残りの塊（空なら次は新しいステップ）。塊 = ディスパッチの並び */
+  private pending: Dispatch[][] = [];
   private pendingDt = 0;
   /** 1ステップを分ける塊の数（RK3 の各段 ×（移流・発散 / 圧力・射影）＋ 微物理） */
   static readonly CHUNKS_PER_STEP = 7;
@@ -276,39 +281,68 @@ export class CloudModel {
     const perms: [number, number, number][] = [[r, r, a], [r, a, b], [r, b, a]];
     const g3 = [Math.ceil(g.nx / 8), Math.ceil(g.ny / 8), g.nz] as const;
     const g2 = [Math.ceil(g.nx / 8), Math.ceil(g.ny / 8), 1] as const;
-    const run = (pass: GPUComputePassEncoder, name: string, bg: GPUBindGroup, slot: number, x: number, y = 1, z = 1) => {
-      pass.setPipeline(this.pipes.get(name)!);
-      pass.setBindGroup(0, bg, [slot * PARAM_SLOT]);
-      pass.dispatchWorkgroups(x, y, z);
-    };
-    const chunks: ((pass: GPUComputePassEncoder) => void)[] = [];
+    const D = (name: string, bg: GPUBindGroup, slot: number, x: number, y = 1, z = 1): Dispatch => ({ name, bg, slot, x, y, z });
+    const chunks: Dispatch[][] = [];
     perms.forEach(([nI, cI, oI], stage) => {
       const bg = this.bind(nI, cI, oI);
-      chunks.push((pass) => {
-        if (stage === 0) run(pass, 'csNu', bg, stage, ...g3);
-        if (stage === 2 && this.cfg.moist && this.cfg.positiveDefinite !== false) run(pass, 'csPdRatio', bg, stage, ...g3);
-        run(pass, 'csScalars', bg, stage, ...g3);
-        run(pass, 'csMomentum', bg, stage, ...g3);
-        run(pass, 'csDivergence', bg, stage, ...g3);
-      });
-      chunks.push((pass) => {
-        run(pass, 'fftXf', bg, stage, g.ny, g.nz);
-        if (g.ny > 1) run(pass, 'fftYf', bg, stage, g.nx, g.nz);
-        run(pass, 'tridiag', bg, stage, ...g2);
-        if (g.ny > 1) run(pass, 'fftYi', bg, stage, g.nx, g.nz);
-        run(pass, 'fftXi', bg, stage, g.ny, g.nz);
-        run(pass, 'csProject', bg, stage, ...g3);
-      });
+      const A: Dispatch[] = [];
+      if (stage === 0) A.push(D('csActDilate', bg, stage, ...g2), D('csNu', bg, stage, ...g3));
+      if (stage === 2 && this.cfg.moist && this.cfg.positiveDefinite !== false) A.push(D('csPdRatio', bg, stage, ...g3));
+      A.push(D('csScalars', bg, stage, ...g3), D('csMomentum', bg, stage, ...g3), D('csDivergence', bg, stage, ...g3));
+      chunks.push(A);
+      const B: Dispatch[] = [D('fftXf', bg, stage, g.ny, g.nz)];
+      if (g.ny > 1) B.push(D('fftYf', bg, stage, g.nx, g.nz));
+      B.push(D('tridiag', bg, stage, ...g2));
+      if (g.ny > 1) B.push(D('fftYi', bg, stage, g.nx, g.nz));
+      B.push(D('fftXi', bg, stage, g.ny, g.nz), D('csProject', bg, stage, ...g3));
+      chunks.push(B);
     });
     const last = this.bind(r, b, a);
-    chunks.push((pass) => {
-      run(pass, 'micro', last, 2, ...g2);
-      run(pass, 'stats', last, 2, g.nz + 1);
-    });
+    chunks.push([D('micro', last, 2, ...g2), D('stats', last, 2, g.nz + 1)]);
     this.pending = chunks;
     this.pendingNext = a;
   }
   private pendingNext = 0;
+
+  private encode(pass: GPUComputePassEncoder, d: Dispatch): void {
+    pass.setPipeline(this.pipes.get(d.name)!);
+    pass.setBindGroup(0, d.bg, [d.slot * PARAM_SLOT]);
+    pass.dispatchWorkgroups(d.x, d.y, d.z);
+  }
+
+  /**
+   * 1ステップをカーネルごとに GPU のタイムスタンプで計測する（開発用。timestamp-query が必要）。
+   * 戻り値：カーネル名 → 1ステップ中の合計 [ms]
+   */
+  async profileStep(): Promise<Record<string, number>> {
+    const d = this.device;
+    if (!d.features.has('timestamp-query')) throw new Error('timestamp-query が使えません');
+    if (this.pending.length === 0) this.beginStep();
+    const list = this.pending.flat();
+    this.pending = [];
+    const qs = d.createQuerySet({ type: 'timestamp', count: list.length * 2 });
+    const res = d.createBuffer({ size: list.length * 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+    const rd = d.createBuffer({ size: list.length * 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const enc = d.createCommandEncoder();
+    list.forEach((x, i) => {
+      const pass = enc.beginComputePass({ timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 2 * i, endOfPassWriteIndex: 2 * i + 1 } });
+      this.encode(pass, x);
+      pass.end();
+    });
+    enc.resolveQuerySet(qs, 0, list.length * 2, res, 0);
+    enc.copyBufferToBuffer(res, 0, rd, 0, list.length * 16);
+    d.queue.submit([enc.finish()]);
+    this.cur = this.pendingNext;
+    this.time += this.pendingDt;
+    this.steps++;
+    await rd.mapAsync(GPUMapMode.READ);
+    const t = new BigInt64Array(rd.getMappedRange().slice(0));
+    rd.unmap();
+    const out: Record<string, number> = {};
+    list.forEach((x, i) => { out[x.name] = (out[x.name] ?? 0) + Number(t[2 * i + 1] - t[2 * i]) / 1e6; });
+    [qs, res, rd].forEach((o) => o.destroy());
+    return out;
+  }
 
   /**
    * 最大 maxChunks 個の塊を実行する（1つのコマンドバッファ）。ステップが完了したら時刻を進める。
@@ -324,7 +358,7 @@ export class CloudModel {
       if (this.pending.length === 0) this.beginStep();
       enc ??= d.createCommandEncoder();
       const pass = enc.beginComputePass({ label: 'sim-chunk' });
-      this.pending.shift()!(pass);
+      for (const x of this.pending.shift()!) this.encode(pass, x);
       pass.end();
       used++;
       if (this.pending.length === 0) {

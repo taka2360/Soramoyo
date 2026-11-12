@@ -101,7 +101,9 @@ fn csPdRatio(@builtin(global_invocation_id) g: vec3u) {
   let i = i32(g.x); let j = i32(g.y); let k = i32(g.z);
   let id = idx(i, j, k);
   let cl = col[k];
+  let act = condActive(i, j);
   for (var f = F_QV; f <= F_QG; f++) {
+    if (f >= F_QC && !act) { diag[dPd(f, id)] = 1.0; continue; }
     let out = (max(sFluxX(f, i + 1, j, k), 0.0) - min(sFluxX(f, i, j, k), 0.0)) / P.dx
             + (max(sFluxY(f, i, j + 1, k), 0.0) - min(sFluxY(f, i, j, k), 0.0)) / P.dy
             + (max(sFluxZ(f, i, j, k + 1), 0.0) - min(sFluxZ(f, i, j, k), 0.0)) / (cl.rho0 * cl.dzc);
@@ -111,6 +113,23 @@ fn csPdRatio(@builtin(global_invocation_id) g: vec3u) {
     diag[dPd(f, id)] = r;
   }
 }
+
+// ---- 凝結物の無い列の省略
+// 微物理が付けた「柱に凝結物あり」の印を水平 ±9 列に広げる（RK3 の3段で、移流の幅 ±3 列ずつ値が広がりうるため）。
+// 印の無い列では、雲水・雨・あられはステップ中ずっと 0 のままなので、その移流・拡散・リミッタを計算しない。
+@compute @workgroup_size(8, 8, 1)
+fn csActDilate(@builtin(global_invocation_id) g: vec3u) {
+  if (g.x >= P.nx || g.y >= P.ny) { return; }
+  var a = 0.0;
+  let rj = select(0, 9, P.ny > 1u);
+  for (var dj = -rj; dj <= rj; dj++) {
+    for (var di = -9; di <= 9; di++) {
+      a = max(a, diag[dSurf(6u, wrapX(i32(g.x) + di) + P.nx * wrapY(i32(g.y) + dj))]);
+    }
+  }
+  diag[dSurf(7u, g.x + P.nx * g.y)] = a;
+}
+fn condActive(i: i32, j: i32) -> bool { return diag[dSurf(7u, wrapX(i) + P.nx * wrapY(j))] > 0.0; }
 
 fn scalarTendency(f: u32, i: i32, j: i32, k: i32, limited: bool) -> f32 {
   let cl = col[k];
@@ -160,9 +179,15 @@ fn csScalars(@builtin(global_invocation_id) g: vec3u) {
   if ((P.flags & FLAG_MOIST) != 0u) {
     let lim = P.stage == 2u && (P.flags & FLAG_PD) != 0u;
     sO[F_QV * P.n + id] = sN[F_QV * P.n + id] + P.dt * scalarTendency(F_QV, i, j, k, lim);
-    sO[F_QC * P.n + id] = sN[F_QC * P.n + id] + P.dt * scalarTendency(F_QC, i, j, k, lim);
-    sO[F_QR * P.n + id] = sN[F_QR * P.n + id] + P.dt * scalarTendency(F_QR, i, j, k, lim);
-    sO[F_QG * P.n + id] = sN[F_QG * P.n + id] + P.dt * scalarTendency(F_QG, i, j, k, lim);
+    if (condActive(i, j)) {
+      sO[F_QC * P.n + id] = sN[F_QC * P.n + id] + P.dt * scalarTendency(F_QC, i, j, k, lim);
+      sO[F_QR * P.n + id] = sN[F_QR * P.n + id] + P.dt * scalarTendency(F_QR, i, j, k, lim);
+      sO[F_QG * P.n + id] = sN[F_QG * P.n + id] + P.dt * scalarTendency(F_QG, i, j, k, lim);
+    } else {
+      sO[F_QC * P.n + id] = sN[F_QC * P.n + id];
+      sO[F_QR * P.n + id] = sN[F_QR * P.n + id];
+      sO[F_QG * P.n + id] = sN[F_QG * P.n + id];
+    }
   } else {
     sO[F_QV * P.n + id] = sN[F_QV * P.n + id];
     sO[F_QC * P.n + id] = 0.0;
