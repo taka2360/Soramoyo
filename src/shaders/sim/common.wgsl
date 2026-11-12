@@ -37,6 +37,9 @@ const FLAG_SMAG: u32 = 2u;
 const FLAG_RAIN: u32 = 4u;
 const FLAG_SURF_ENERGY: u32 = 8u; // 地表エネルギー収支で顕熱・潜熱を求める（0 なら固定フラックス）
 const FLAG_PD: u32 = 16u;         // 水物質の正値保存リミッタ
+const FLAG_ICE: u32 = 32u;        // 氷相（雲氷・雪）を温度で分ける
+const FLAG_LW: u32 = 64u;         // 雲の長波放射（雲頂の冷却・雲底の加熱）
+const FLAG_DYCOMS: u32 = 128u;    // DYCOMS-II の放射式の第3項（逆転層より上の沈降に伴う項）
 
 struct Params {
   nx: u32, ny: u32, nz: u32, n: u32,
@@ -92,6 +95,22 @@ fn qvsatLiq(T: f32, p: f32) -> f32 {
   let es = min(esatLiq(T), p * 0.5);
   return EPSV * es / (p - es);
 }
+// 氷面の飽和水蒸気圧（Magnus 型、Alduchov & Eskridge 1996）
+fn esatIce(T: f32) -> f32 {
+  let tc = T - 273.15;
+  return 611.2 * exp(22.46 * tc / (tc + 272.62));
+}
+fn qvsatIce(T: f32, p: f32) -> f32 {
+  let es = min(esatIce(T), p * 0.5);
+  return EPSV * es / (p - es);
+}
+
+const LS: f32 = 2.834e6; // 昇華熱
+// 温度による相の分け方（SAM: Khairoutdinov & Randall 2003 と同じ温度範囲）
+// 雲の凝結物のうち水の割合：0℃以上は水、−20℃以下は氷
+fn liqFracCloud(T: f32) -> f32 { return clamp((T - 253.16) / 20.0, 0.0, 1.0); }
+// 降水のうち雨の割合：10℃以上は雨、−5℃以下は雪
+fn liqFracPrecip(T: f32) -> f32 { return clamp((T - 268.16) / 15.0, 0.0, 1.0); }
 
 // ---------------------------------------------------------------- 移流スキーム
 // 面 (a-1/2) での値。m3..p2 は a-3 .. a+2 の値、vel はその面の速度

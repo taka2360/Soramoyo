@@ -2,9 +2,9 @@
 //  1. 負値の切り詰め（量は監視用に記録）
 //  2. 大規模強制：沈降による移流、θ・qv の強制、基本場へのナッジング
 //  3. 地表：エネルギー収支（地温の予報）から顕熱・潜熱、または固定フラックス。地表摩擦
-//  4. 雲微物理（暖かい雨）：飽和調整 + Kessler（自動変換・捕捉・蒸発）
-//  5. 雨の落下
-// 微物理の式は Klemp & Wilhelmson (1978) / WRF の Kessler スキームに準拠。
+//  4. 雲の長波放射（雲頂の冷却）
+//  5. 雲微物理（混合相の1モーメント）：飽和調整、自動変換・捕捉・蒸発（雨は Kessler / KW78）
+//  6. 降水の落下（雨と雪）
 
 const MAXNZ_M: u32 = 256u;
 const SIGMA_SB: f32 = 5.670e-8;
@@ -131,69 +131,144 @@ fn csMicro(@builtin(global_invocation_id) g: vec3u) {
     if (P.ny > 1u) { sO[F_V * P.n + id0] = (so(F_V, id0) + P.frameV) * k0 - P.frameV; }
   }
 
-  // ---- 4. 雲微物理
+  // ---- 4. 長波放射（雲頂での冷却、雲底での加熱）
+  // Stevens et al. (2005) の DYCOMS-II の式：F(z) = F0·exp(−Q(z,∞)) + F1·exp(−Q(0,z)) [+ 第3項]
+  //   Q = κ ∫ρ q_n dz（κ = 85 m²/kg）。雲が厚ければ雲頂で約 70 W/m² の冷却になる。
+  // 雲の無いところの冷却（晴天の放射冷却）は大規模強制 thLs で別に与える。
+  if (moist && (P.flags & FLAG_LW) != 0u) {
+    var qAbove: array<f32, MAXNZ_M>;
+    var acc = 0.0;
+    for (var kk = i32(nz) - 1; kk >= 0; kk--) {
+      let k = u32(kk);
+      qAbove[k] = acc; // 上面より上の積算
+      acc += 85.0 * col[k].rho0 * so(F_QC, base + pl * k) * col[k].dzc;
+    }
+    let qTotal = acc;
+    // 逆転層の高さ（DYCOMS 用）：qt が 8 g/kg を下回る最初の高さ
+    var zi = 1e9;
+    if ((P.flags & FLAG_DYCOMS) != 0u) {
+      for (var k = 0u; k < nz; k++) {
+        if (qvC[k] + so(F_QC, base + pl * k) < 0.008) { zi = col[k].zf; break; }
+      }
+    }
+    var below = 0.0;
+    var fPrev = 70.0 * exp(-qTotal) + 22.0; // 地表面での正味の上向きフラックス
+    for (var k = 0u; k < nz; k++) {
+      let cl = col[k];
+      below += 85.0 * cl.rho0 * so(F_QC, base + pl * k) * cl.dzc;
+      let zTop = cl.zf + cl.dzc;
+      var fTop = 70.0 * exp(-qAbove[k]) + 22.0 * exp(-below);
+      if (zTop > zi) {
+        let dz = zTop - zi;
+        fTop += 1.12 * CP * 3.75e-6 * (0.25 * pow(dz, 4.0 / 3.0) + zi * pow(dz, 1.0 / 3.0));
+      }
+      thC[k] -= dt * (fTop - fPrev) / (cl.rho0 * CP * cl.pi0 * cl.dzc);
+      fPrev = fTop;
+    }
+  }
+
+  // ---- 5. 雲微物理（1モーメント、混合相。SAM と同じ考え方）
+  // 雲の凝結物 qn（= 雲水 + 雲氷）と降水 qp（= 雨 + 雪）を予報し、水と氷の割合は温度で決める。
+  // 相変化の熱は「氷・液水温位」θil を保存したまま温度を解き直すことで、凍結・融解の熱も含めて自動で入る。
+  let ice = (P.flags & FLAG_ICE) != 0u;
   for (var k = 0u; k < nz; k++) {
     let id = base + pl * k;
     let cl = col[k];
     var th = thC[k];
     var qv = qvC[k];
-    var qc = so(F_QC, id);
-    var qr = qrCol[k];
+    var qn = so(F_QC, id);
+    var qp = qrCol[k];
     let p = cl.p0;
     let pi = cl.pi0;
 
     if (moist) {
+      let T0 = th * pi;
+      var wn = 1.0; var wp = 1.0;
+      if (ice) { wn = liqFracCloud(T0); wp = liqFracPrecip(T0); }
+      // 保存量 θil（このステップの相変化で変わらない）
+      let thil = th - (LV * (wn * qn + wp * qp) + LS * ((1.0 - wn) * qn + (1.0 - wp) * qp)) / (CP * pi);
+
       if (rain) {
-        let qcOld = qc;
-        let autoc = max(0.001 * (qc - 0.001), 0.0);
-        qc = (qc - dt * autoc) / (1.0 + dt * 2.2 * pow(max(qr, 0.0), 0.875));
-        qc = max(qc, 0.0);
-        qr += qcOld - qc;
-      }
-      for (var it = 0; it < 3; it++) {
-        let T = th * pi;
-        let qs = qvsatLiq(T, p);
-        if (qv <= qs && qc <= 0.0) { break; }
-        let tc = T - 273.15;
-        let dlnes = 17.67 * 243.5 / ((tc + 243.5) * (tc + 243.5));
-        var dq = (qv - qs) / (1.0 + (LV / CP) * qs * dlnes);
-        dq = max(dq, -qc);
-        th += LV / (CP * pi) * dq;
-        qv -= dq;
-        qc += dq;
-      }
-      if (rain && qr > 0.0) {
-        let T = th * pi;
-        let qs = qvsatLiq(T, p);
-        if (qv < qs) {
-          let rhoqr = 0.001 * cl.rho0 * qr; // [g/cm³]
-          let cvent = 1.6 + 124.9 * pow(rhoqr, 0.2046);
-          var ern = dt * (cvent * pow(rhoqr, 0.525)) / (2.55e8 / (p * qs) + 5.4e5) * ((qs - qv) / (0.001 * cl.rho0 * qs));
-          let tc = T - 273.15;
-          let dlnes = 17.67 * 243.5 / ((tc + 243.5) * (tc + 243.5));
-          let deficit = (qs - qv) / (1.0 + (LV / CP) * qs * dlnes);
-          ern = min(min(ern, deficit), qr);
-          th -= LV / (CP * pi) * ern;
-          qv += ern;
-          qr -= ern;
+        // 自動変換：雲水 → 雨（Kessler）、雲氷 → 雪（併合、温度依存。Lin et al. 1983 の形）
+        let ql = wn * qn;
+        let qi = (1.0 - wn) * qn;
+        let autL = 0.001 * max(ql - 0.001, 0.0);
+        let autI = 0.001 * exp(0.025 * (T0 - 273.16)) * max(qi - 1e-4, 0.0);
+        // 捕捉：降水が雲粒を集める（雨は Kessler、雪は効率を下げた同じ形）
+        let effAcc = wp + (1.0 - wp) * 0.5;
+        let rate = autL + autI;
+        let qnOld = qn;
+        qn = (qn - dt * rate) / (1.0 + dt * 2.2 * effAcc * pow(max(qp, 0.0), 0.875));
+        qn = max(qn, 0.0);
+        qp += qnOld - qn;
+
+        // 降水の蒸発・昇華（未飽和のとき）。雨は Klemp–Wilhelmson、雪は同じ形を半分の効率で
+        if (qp > 0.0) {
+          let qsl = qvsatLiq(T0, p);
+          let qsi = qvsatIce(T0, p);
+          let qsm = wp * qsl + (1.0 - wp) * qsi;
+          if (qv < qsm) {
+            let rhoqp = 0.001 * cl.rho0 * qp;
+            let cvent = 1.6 + 124.9 * pow(rhoqp, 0.2046);
+            var ern = dt * (cvent * pow(rhoqp, 0.525)) / (2.55e8 / (p * qsm) + 5.4e5) * ((qsm - qv) / (0.001 * cl.rho0 * qsm));
+            ern *= wp + (1.0 - wp) * 0.5;
+            ern = min(min(ern, 0.5 * (qsm - qv)), qp);
+            qv += ern;
+            qp -= ern;
+          }
         }
       }
+
+      // 飽和調整：qt_n = qv + qn と θil を保ったまま、qv = 混合相の飽和混合比 となる温度を Newton 法で解く
+      let qtn = qv + qn;
+      let tl = thil * pi;
+      var T = T0;
+      for (var it = 0; it < 4; it++) {
+        var f0: f32; var f1: f32;
+        for (var j = 0; j < 2; j++) {
+          let Tj = T + f32(j) * 0.05;
+          var a = 1.0; var b = 1.0;
+          if (ice) { a = liqFracCloud(Tj); b = liqFracPrecip(Tj); }
+          let qs = a * qvsatLiq(Tj, p) + (1.0 - a) * qvsatIce(Tj, p);
+          let qnj = max(qtn - qs, 0.0);
+          let fj = Tj - tl - (LV * (a * qnj + b * qp) + LS * ((1.0 - a) * qnj + (1.0 - b) * qp)) / CP;
+          if (j == 0) { f0 = fj; } else { f1 = fj; }
+        }
+        let d = (f1 - f0) / 0.05;
+        T -= f0 / max(d, 0.1);
+      }
+      var a = 1.0;
+      if (ice) { a = liqFracCloud(T); }
+      let qs = a * qvsatLiq(T, p) + (1.0 - a) * qvsatIce(T, p);
+      qn = max(qtn - qs, 0.0);
+      qv = qtn - qn;
+      th = T / pi;
     }
     sO[F_TH * P.n + id] = th;
     sO[F_QV * P.n + id] = qv;
-    sO[F_QC * P.n + id] = qc;
-    qrCol[k] = qr;
+    sO[F_QC * P.n + id] = qn;
+    qrCol[k] = qp;
   }
 
-  // ---- 5. 雨の落下（風上差分、CFL に応じて小分け）
+  // ---- 6. 降水の落下（風上差分、CFL に応じて小分け）。雨と雪の割合で落下速度を混ぜる
   var precip = 0.0;
   if (moist && rain) {
     let rhoS = col[0].rho0;
+    var vtC: array<f32, MAXNZ_M>;
     var maxC = 0.0;
     for (var k = 0u; k < nz; k++) {
       let cl = col[k];
-      let vt = 36.34 * pow(max(0.001 * cl.rho0 * qrCol[k], 0.0), 0.1364) * sqrt(rhoS / cl.rho0);
-      maxC = max(maxC, vt * dt / cl.dzc);
+      let rq = max(0.001 * cl.rho0 * qrCol[k], 0.0);
+      let vr = 36.34 * pow(rq, 0.1364) * sqrt(rhoS / cl.rho0);
+      var v = vr;
+      if (ice) {
+        let wp = liqFracPrecip(sO[F_TH * P.n + base + pl * k] * cl.pi0);
+        // 雪（あられを含めた平均的な値）：おおむね 0.5〜2 m/s
+        let vs = clamp(3.0 * pow(rq * 1000.0, 0.11), 0.3, 2.5) * sqrt(rhoS / cl.rho0);
+        v = wp * vr + (1.0 - wp) * vs;
+      }
+      vtC[k] = v;
+      maxC = max(maxC, v * dt / cl.dzc);
     }
     let nsub = u32(clamp(ceil(maxC / 0.8), 1.0, 50.0));
     let dts = dt / f32(nsub);
@@ -203,8 +278,7 @@ fn csMicro(@builtin(global_invocation_id) g: vec3u) {
         let k = u32(kk);
         let cl = col[k];
         let q = qrCol[k];
-        let vt = 36.34 * pow(max(0.001 * cl.rho0 * q, 0.0), 0.1364) * sqrt(rhoS / cl.rho0);
-        let fluxOut = cl.rho0 * q * vt;
+        let fluxOut = cl.rho0 * q * vtC[k];
         qrCol[k] = max(q + dts * (fluxAbove - fluxOut) / (cl.rho0 * cl.dzc), 0.0);
         fluxAbove = fluxOut;
       }

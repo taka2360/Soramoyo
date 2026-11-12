@@ -46,7 +46,16 @@ fn sphere(o: vec3f, d: vec3f, rad: f32) -> vec2f {
 fn altitude(p: vec3f) -> f32 { return length(p - vec3f(0.0, 0.0, -EARTH_R_M)) - EARTH_R_M; }
 
 // ---------------------------------------------------------------- 密度
-struct Medium { sigma: f32, odSun: f32, odUp: f32 };
+struct Medium { sigma: f32, odSun: f32, odUp: f32, iceFrac: f32 };
+
+// 氷晶の位相関数：強い前方散乱（HG, g=0.75）＋ 22° ハロ（六角柱の氷晶の屈折）。
+// ハロは全散乱の 3% を 22° ± 0.6° のガウス形に割り当てる簡易表現（46° ハロ・幻日などは無し）
+fn icePhase(c: f32) -> f32 {
+  let th = acos(clamp(c, -1.0, 1.0));
+  let d = (th - 0.3840) / 0.01047;
+  let halo = exp(-d * d) / 0.0437;
+  return 0.97 * hg(0.75, c) + 0.03 * halo;
+}
 
 fn domainUvw(p: vec3f, h: f32) -> vec3f {
   return vec3f((p.x - C.origin.x) / C.size.x, (p.y - C.origin.y) / C.size.y, zToW(zmap, h, C.ztop, C.nz));
@@ -75,8 +84,9 @@ fn sampleMedium(p: vec3f, h: f32, withShadow: bool) -> Medium {
   let lx = p.x - C.origin.x;
   let ly = p.y - C.origin.y;
   let uvw = vec3f(lx / C.size.x, ly / C.size.y, zToW(zmap, h, C.ztop, C.nz));
-  let v = textureSampleLevel(vol, smpRep, uvw, 0.0);
-  var lwc = v.r; // g/m³
+  let v = sampleVolSmoothZ(vol, smpRep, uvw);
+  var lwc = v.r; // 雲水 g/m³
+  var iwc = v.g; // 雲氷 g/m³
   // ---- 細部合成（試作）：格子より細かい縁の凹凸。
   // 雲水量に比例して削る（固定量で削ると、薄い雲がノイズの形だけ残って繊維状に見えるため）。
   // 縁（雲水量の少ない所）ほど強く、渦粘性（乱流の強さ）が大きいほど強く削る。
@@ -84,13 +94,17 @@ fn sampleMedium(p: vec3f, h: f32, withShadow: bool) -> Medium {
     let q = vec3f(lx, ly, h) / C.noisePeriod + vec3f(0.0, 0.0, C.time * 0.0005);
     let n = textureSampleLevel(noiseTex, smpRep, q, 0.0);
     let n2 = textureSampleLevel(noiseTex, smpRep, q * 3.7, 0.0);
-    let turb = clamp(v.b / 20.0, 0.0, 1.0);
+    let turb = clamp(v.a / 20.0, 0.0, 1.0);
     let shape = mix(n.r * 0.6 + n.g * 0.4, n2.g * 0.5 + n2.b * 0.5, 0.35);
     let edge = 1.0 - clamp(lwc / 0.6, 0.0, 1.0);
     let cut = C.detail * (0.5 + 0.5 * turb) * edge * (1.0 - shape);
-    lwc *= clamp(1.0 - 1.6 * cut, 0.0, 1.0);
+    let keep = clamp(1.0 - 1.6 * cut, 0.0, 1.0);
+    lwc *= keep;
+    iwc *= keep;
   }
-  m.sigma = sigmaCloud(lwc * 1e-3, C.nDrop) + sigmaRain(v.g * 1e-3);
+  let sI = sigmaIce(iwc * 1e-3);
+  m.sigma = sigmaCloud(lwc * 1e-3, C.nDrop) + sI + sigmaRain(v.b * 1e-3);
+  m.iceFrac = select(0.0, sI / m.sigma, m.sigma > 0.0);
   if (withShadow && m.sigma > 0.0) {
     m.odUp = textureSampleLevel(shadowVol, smpRep, uvw, 0.0).g;
   }
@@ -187,7 +201,12 @@ fn march(in: VsOut) -> vec4f {
   var phases: array<f32, 4>;
   let iso = 1.0 / (4.0 * PI);
   let p0 = cloudPhase(cosT, dropD);
-  for (var i = 0; i < 4; i++) { phases[i] = mix(p0, iso, 1.0 - pow(0.5, f32(i))); }
+  var phasesI: array<f32, 4>;
+  let pI = icePhase(cosT);
+  for (var i = 0; i < 4; i++) {
+    phases[i] = mix(p0, iso, 1.0 - pow(0.5, f32(i)));
+    phasesI[i] = mix(pI, iso, 1.0 - pow(0.5, f32(i)));
+  }
 
   var T = 1.0;
   var L = vec3f(0.0);
@@ -214,7 +233,7 @@ fn march(in: VsOut) -> vec4f {
       var S = vec3f(0.0);
       var a = 1.0; var b = 1.0;
       for (var oc = 0; oc < 4; oc++) {
-        S += b * sunE * phases[oc] * exp(-a * m.odSun);
+        S += b * sunE * mix(phases[oc], phasesI[oc], m.iceFrac) * exp(-a * m.odSun);
         a *= 0.5; b *= 0.5;
       }
       // 環境光：上半球は空、下半球は地面の照り返し（雲による遮りを上下の光学的厚さで近似）

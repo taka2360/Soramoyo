@@ -43,6 +43,12 @@ export interface ModelConfig {
   surface?: { albedo: number; soilWet: number; tDeep: number; cSoil: number };
   /** 水物質の正値保存リミッタ */
   positiveDefinite?: boolean;
+  /** 氷相（温度で雲水/雲氷・雨/雪を分ける） */
+  ice?: boolean;
+  /** 雲の長波放射（雲頂冷却） */
+  longwave?: boolean;
+  /** DYCOMS-II の放射式の第3項（逆転層上の沈降に伴う項） */
+  dycomsRadiation?: boolean;
   /** 時間刻みの上限 [s] と目標 CFL 数 */
   dtMax: number;
   cfl: number;
@@ -218,7 +224,8 @@ export class CloudModel {
     const g = this.cfg.grid;
     const c = this.cfg;
     const flags = (c.moist ? 1 : 0) | (c.smagorinsky ? 2 : 0) | (c.rain ? 4 : 0) |
-      (c.surfaceEnergy ? 8 : 0) | (c.positiveDefinite !== false ? 16 : 0);
+      (c.surfaceEnergy ? 8 : 0) | (c.positiveDefinite !== false ? 16 : 0) |
+      (c.ice ? 32 : 0) | (c.longwave ? 64 : 0) | (c.dycomsRadiation ? 128 : 0);
     const sf = c.surface ?? { albedo: 0.2, soilWet: 0.3, tDeep: 295, cSoil: 2e5 };
     const fr = c.frame ?? [0, 0];
     const buf = new ArrayBuffer(PARAM_SLOT * 3);

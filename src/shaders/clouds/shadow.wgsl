@@ -21,8 +21,8 @@ struct Col {
 
 fn sigmaAt(p: vec3f) -> f32 {
   let uvw = vec3f(p.x / C.size.x, p.y / C.size.y, zToW(zmap, p.z, C.ztop, C.nz));
-  let v = textureSampleLevel(vol, smpRep, uvw, 0.0);
-  return sigmaCloud(v.r * 1e-3, C.nDrop) + sigmaRain(v.g * 1e-3);
+  let v = sampleVolSmoothZ(vol, smpRep, uvw);
+  return sigmaVolume(v, C.nDrop);
 }
 
 fn opticalDepth(p0: vec3f, dir: vec3f) -> f32 {

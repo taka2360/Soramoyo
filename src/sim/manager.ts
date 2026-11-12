@@ -1,5 +1,5 @@
 import { CloudModel } from './model';
-import { type SimCase, weismanKlemp, bomex, landDay } from './cases';
+import { type SimCase, weismanKlemp, bomex, landDay, dycoms } from './cases';
 
 export const SCENARIOS: Record<string, (latDeg: number) => SimCase> = {
   '夏の晴れた日・陸上（128², 100m）': (lat) => landDay({
@@ -19,6 +19,7 @@ export const SCENARIOS: Record<string, (latDeg: number) => SimCase> = {
     sounding: 'wk', nx: 256, dx: 250, dzMin: 80, ztop: 16000, soilWet: 0.5, windMs: 4, latDeg: lat,
   }),
   '貿易風の海（BOMEX, 128², 100m）': () => bomex({ nx: 128, dx: 100, dz: 40 }),
+  '海上の層積雲・雲海（DYCOMS-II, 128², 50m）': () => dycoms({ nx: 128, dx: 50, dzFine: 10 }),
   '積乱雲（暖気泡, 256², 250m）': () => weismanKlemp({ nx: 256, dx: 250, dzMin: 150, shear: 10, qv0: 0.014 }),
 };
 

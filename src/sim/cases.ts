@@ -221,7 +221,7 @@ export function weismanKlemp(opts: { nx: number; dx: number; dzMin: number; shea
     duration: 7200,
     config: {
       grid, base, moist: true, rain: true, smagorinsky: true, nuConst: 0, cs: 0.18, prandtl: 1 / 3, shf: 0, lhf: 0,
-      spongeZ: 15000, spongeRate: 1 / 300, dtMax: 6, cfl: 0.8, frame: [us / 2, 0],
+      spongeZ: 15000, spongeRate: 1 / 300, dtMax: 6, cfl: 0.8, frame: [us / 2, 0], ice: true, longwave: true,
     },
     initial: a,
   };
@@ -405,10 +405,79 @@ export function landDay(opts: {
     config: {
       grid, base, moist: true, rain: true, smagorinsky: true, nuConst: 0, cs: 0.18, prandtl: 1 / 3,
       shf: 0, lhf: 0, forcing, fcor: coriolis(opts.latDeg), frame, z0: 0.1,
-      surfaceEnergy: true,
+      surfaceEnergy: true, ice: true, longwave: true,
       surface: { albedo: 0.2, soilWet: opts.soilWet, tDeep: t0 + 1, cSoil: 2.0e5 },
       spongeZ: opts.ztop * 0.8, spongeRate: 1 / 300, dtMax: 4, cfl: 0.7,
     },
     initial: a,
   };
+}
+
+// ---------------------------------------------------------------------------
+/** 指定した高さの帯だけ細かくした鉛直格子（逆転層を解像するため） */
+export function bandLevels(dzFine: number, zFineBot: number, zFineTop: number, dzCoarse: number, ztop: number): number[] {
+  const zf = [0];
+  while (zf[zf.length - 1] < ztop - 1e-6) {
+    const z = zf[zf.length - 1];
+    // 帯の外は dzCoarse、帯の中は dzFine、境目はなめらかに（1.15 倍ずつ）
+    const prev = zf.length > 1 ? z - zf[zf.length - 2] : dzCoarse;
+    const target = z >= zFineBot - 3 * dzCoarse && z < zFineTop ? dzFine : dzCoarse;
+    const dz = target < prev ? Math.max(target, prev / 1.15) : Math.min(target, prev * 1.15);
+    zf.push(Math.min(z + dz, ztop));
+  }
+  return zf;
+}
+
+/**
+ * DYCOMS-II RF01（Stevens et al. 2005）：カリフォルニア沖の夜の層積雲。
+ * 強い逆転層（約 840 m）の下に一様な雲の層ができ、雲頂の長波放射冷却で対流が駆動される。
+ * 「雲海」の典型。解像度への要求が厳しく（本家は鉛直 5 m）、粗いと雲頂で乾いた空気を取り込みすぎて雲が薄くなる。
+ * 参照（LES 群、2〜4時間）：雲頂 ≈ 850〜870 m、雲底 ≈ 600 m、雲量 ≈ 1、LWP ≈ 20〜60 g/m²（観測 ≈ 40〜60）。
+ */
+export function dycoms(opts: { nx: number; dx: number; dzFine: number }): SimCase {
+  const zi = 840;
+  const zf = bandLevels(opts.dzFine, 650, 1000, 25, 1500);
+  const grid = makeGrid({ nx: opts.nx, ny: opts.nx, dx: opts.dx, dy: opts.dx, zf });
+  const thl = (z: number) => (z <= zi ? 289.0 : 297.5 + Math.cbrt(z - zi));
+  const qt = (z: number) => (z <= zi ? 9.0e-3 : 1.5e-3);
+  // 初期状態は θl, qt。雲の中は飽和調整して θ, qv, qc に分ける
+  const frame: [number, number] = [7, -5.5];
+  const snd: Sounding = { surfacePressure: 101780, theta: thl, qv: qt, u: () => 0, v: () => 0 };
+  const forcing: LargeScaleForcing = {
+    ug: () => 7, vg: () => -5.5,
+    wsub: (z) => -3.75e-6 * z,
+    thLs: () => 0, qvLs: () => 0, nudge: () => 0,
+  };
+  const base = buildBaseState(grid, snd);
+  const a = alloc(grid);
+  fillBase(grid, base, a);
+  const n = grid.nx * grid.ny * grid.nz;
+  const plane = grid.nx * grid.ny;
+  const r = rng(2024);
+  for (let k = 0; k < grid.nz; k++) {
+    for (let p = 0; p < plane; p++) {
+      const id = p + plane * k;
+      let th = base.th0[k];
+      if (grid.zc[k] < 800) th += (r() - 0.5) * 0.2;
+      const [t2, v2, c2] = saturationAdjust(th, qt(grid.zc[k]), 0, base.p0[k], base.pi0[k]);
+      a[F.TH * n + id] = t2;
+      a[F.QV * n + id] = v2;
+      a[F.QC * n + id] = c2;
+    }
+  }
+  const rho = base.rho0[0];
+  return {
+    name: 'DYCOMS-II RF01 層積雲（検証）',
+    description: '夜の海上の層積雲（雲海）。雲頂の放射冷却で対流が起こる。雨なし（Stevens et al. 2005）。',
+    reference: '参照（2〜4h）：雲頂≈0.85km 雲底≈0.6km 雲量≈100% LWP≈20〜60 g/m²',
+    duration: 4 * 3600,
+    config: {
+      grid, base, moist: true, rain: false, smagorinsky: true, nuConst: 0, cs: 0.18, prandtl: 1 / 3,
+      shf: 15, lhf: 115, forcing, fcor: 7.62e-5, frame, ustar: 0.25, z0: 0.0002,
+      spongeZ: 1250, spongeRate: 1 / 300, dtMax: 2, cfl: 0.6,
+      longwave: true, dycomsRadiation: true,
+    },
+    initial: a,
+  };
+  void rho;
 }

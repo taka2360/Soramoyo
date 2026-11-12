@@ -113,7 +113,7 @@ export class CloudVolume {
       this.zmap = this.makeZmap(g);
       const d = new ArrayBuffer(32);
       new Uint32Array(d, 0, 4).set([g.nx, g.ny, g.nz, model.n]);
-      new Float32Array(d, 16, 4).set([g.dx, g.dy, 0, 0]);
+      new Float32Array(d, 16, 4).set([g.dx, g.dy, model.cfg.ice ? 1 : 0, 0]);
       this.device.queue.writeBuffer(this.dims, 0, d);
       this.enabled = true;
     } else {
