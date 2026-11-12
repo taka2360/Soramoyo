@@ -29,6 +29,7 @@ const FIELDS: Record<string, FieldDef> = {
   "qv' [kg/kg]": { name: "qv'", f: F.QV, cmap: 0, range: [-0.004, 0.004] },
   'qc 雲水 [kg/kg]': { name: 'qc', f: F.QC, cmap: 1, range: [0, 0.004] },
   'qr 雨水 [kg/kg]': { name: 'qr', f: F.QR, cmap: 1, range: [0, 0.006] },
+  'qg あられ [kg/kg]': { name: 'qg', f: F.QG, cmap: 1, range: [0, 0.006] },
 };
 
 async function main() {

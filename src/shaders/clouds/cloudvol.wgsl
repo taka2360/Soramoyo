@@ -1,6 +1,6 @@
 // 雲ボリュームの準備：
 //  csToVolume : 計算モデルの状態 → 描画用 3D テクスチャ（rgba16float）
-//               r = 雲水 [g/m³]、g = 雲氷 [g/m³]、b = 降水（雨換算）[g/m³]、a = 渦粘性 [m²/s]
+//               r = 雲水 [g/m³]、g = 雲氷 [g/m³]、b = 降水（雨換算。雪は 5 倍、あられは等倍）[g/m³]、a = 渦粘性 [m²/s]
 //  csShadow   : 各点から太陽方向への光学的厚さ（r）と真上方向の光学的厚さ（g）
 //  csNoise    : 細部合成用のタイル可能なノイズ（Perlin–Worley, 128³）
 // （cloudcommon.wgsl の後ろに連結）
@@ -32,6 +32,7 @@ fn csToVolume(@builtin(global_invocation_id) g: vec3u) {
   let rho = col[g.z].rho0;
   let qn = max(st[5u * D.n + id], 0.0);
   let qp = max(st[6u * D.n + id], 0.0);
+  let qg = max(st[7u * D.n + id], 0.0);  // あられ：消散は雨とほぼ同じ（N0 = 4×10⁵, 密度 500 で σ ≈ 3.2 ρq）
   var wn = 1.0; var wp = 1.0;
   if (D.ice > 0.5) {
     let T = st[3u * D.n + id] * col[g.z].pi0;
@@ -40,5 +41,5 @@ fn csToVolume(@builtin(global_invocation_id) g: vec3u) {
   }
   let nu = diag[id];
   let k = rho * 1000.0;
-  textureStore(volOut, g, vec4f(qn * wn * k, qn * (1.0 - wn) * k, qp * (wp + 5.0 * (1.0 - wp)) * k, nu));
+  textureStore(volOut, g, vec4f(qn * wn * k, qn * (1.0 - wn) * k, (qp * (wp + 5.0 * (1.0 - wp)) + qg) * k, nu));
 }

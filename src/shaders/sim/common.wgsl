@@ -1,7 +1,7 @@
 // =============================================================================
 // 雲解像モデル 共通定義
 // 格子：Arakawa C。index = i + nx*(j + ny*k)。水平は周期境界。
-// state バッファ：7 変数を連続配置 [U, V, W, TH, QV, QC, QR] × n
+// state バッファ：8 変数を連続配置 [U, V, W, TH, QV, QC, QR, QG] × n
 //   U[i] は x 面 i-1/2、V[j] は y 面 j-1/2、W[k] は下面 k-1/2（W[k=0]=0）
 // =============================================================================
 
@@ -12,7 +12,8 @@ const F_TH: u32 = 3u;
 const F_QV: u32 = 4u;
 const F_QC: u32 = 5u;
 const F_QR: u32 = 6u;
-const NFIELDS: u32 = 7u;
+const F_QG: u32 = 7u;   // あられ・ひょう（常に氷。速く落ちる）
+const NFIELDS: u32 = 8u;
 
 // diag バッファ（n = 全セル数, plane = nx*ny）
 //   [0, n)              渦粘性 [m²/s]
@@ -22,7 +23,7 @@ const NFIELDS: u32 = 7u;
 //   [n+3plane, +plane)  地表の顕熱フラックス H [W/m²]
 //   [n+4plane, +plane)  地表の潜熱フラックス LE [W/m²]
 //   [n+5plane, +plane)  地表の日射 [W/m²]
-//   [2n, 5n)            正値保存リミッタの係数（qv, qc, qr）
+//   [2n, 6n)            正値保存リミッタの係数（qv, qc, qr, qg）
 const D_NU: u32 = 0u;
 const D_PRECIP: u32 = 1u;
 

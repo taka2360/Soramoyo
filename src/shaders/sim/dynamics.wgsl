@@ -26,8 +26,8 @@ fn csNu(@builtin(global_invocation_id) g: vec3u) {
     let s2 = 2.0 * (dudx * dudx + dvdy * dvdy + dwdz * dwdz) +
              (dudy + dvdx) * (dudy + dvdx) + (dudz + dwdx) * (dudz + dwdx) + (dvdz + dwdy) * (dvdz + dwdy);
     // 浮力による抑制（Lilly 1962）：N² は仮温位から
-    let thvp = c(F_TH, i, j, kp) * (1.0 + 0.608 * c(F_QV, i, j, kp) - c(F_QC, i, j, kp) - c(F_QR, i, j, kp));
-    let thvm = c(F_TH, i, j, km) * (1.0 + 0.608 * c(F_QV, i, j, km) - c(F_QC, i, j, km) - c(F_QR, i, j, km));
+    let thvp = c(F_TH, i, j, kp) * (1.0 + 0.608 * c(F_QV, i, j, kp) - c(F_QC, i, j, kp) - c(F_QR, i, j, kp) - c(F_QG, i, j, kp));
+    let thvm = c(F_TH, i, j, km) * (1.0 + 0.608 * c(F_QV, i, j, km) - c(F_QC, i, j, km) - c(F_QR, i, j, km) - c(F_QG, i, j, km));
     let n2 = GRAV / cl.th0 * (thvp - thvm) / dzz;
     let fri = sqrt(max(0.0, 1.0 - n2 / (P.prandtl * max(s2, 1e-10))));
     var delta: f32;
@@ -101,7 +101,7 @@ fn csPdRatio(@builtin(global_invocation_id) g: vec3u) {
   let i = i32(g.x); let j = i32(g.y); let k = i32(g.z);
   let id = idx(i, j, k);
   let cl = col[k];
-  for (var f = F_QV; f <= F_QR; f++) {
+  for (var f = F_QV; f <= F_QG; f++) {
     let out = (max(sFluxX(f, i + 1, j, k), 0.0) - min(sFluxX(f, i, j, k), 0.0)) / P.dx
             + (max(sFluxY(f, i, j + 1, k), 0.0) - min(sFluxY(f, i, j, k), 0.0)) / P.dy
             + (max(sFluxZ(f, i, j, k + 1), 0.0) - min(sFluxZ(f, i, j, k), 0.0)) / (cl.rho0 * cl.dzc);
@@ -162,10 +162,12 @@ fn csScalars(@builtin(global_invocation_id) g: vec3u) {
     sO[F_QV * P.n + id] = sN[F_QV * P.n + id] + P.dt * scalarTendency(F_QV, i, j, k, lim);
     sO[F_QC * P.n + id] = sN[F_QC * P.n + id] + P.dt * scalarTendency(F_QC, i, j, k, lim);
     sO[F_QR * P.n + id] = sN[F_QR * P.n + id] + P.dt * scalarTendency(F_QR, i, j, k, lim);
+    sO[F_QG * P.n + id] = sN[F_QG * P.n + id] + P.dt * scalarTendency(F_QG, i, j, k, lim);
   } else {
     sO[F_QV * P.n + id] = sN[F_QV * P.n + id];
     sO[F_QC * P.n + id] = 0.0;
     sO[F_QR * P.n + id] = 0.0;
+    sO[F_QG * P.n + id] = 0.0;
   }
 }
 
@@ -235,7 +237,7 @@ fn wFluxZ(i: i32, j: i32, kc: i32) -> f32 { // セル中心 kc（w[kc] と w[kc+
 fn buoyancyCenter(i: i32, j: i32, k: i32) -> f32 {
   let cl = col[k];
   return GRAV * ((c(F_TH, i, j, k) - cl.th0) / cl.th0 + 0.608 * (c(F_QV, i, j, k) - cl.qv0)
-                 - c(F_QC, i, j, k) - c(F_QR, i, j, k));
+                 - c(F_QC, i, j, k) - c(F_QR, i, j, k) - c(F_QG, i, j, k));
 }
 
 // 速度成分の拡散（ν∇²、鉛直は自由すべり）

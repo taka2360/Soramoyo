@@ -22,7 +22,7 @@ fn csStats(@builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wid:
       let th = sO[F_TH * P.n + id];
       let qv = sO[F_QV * P.n + id];
       let qc = sO[F_QC * P.n + id];
-      let qr = sO[F_QR * P.n + id];
+      let qr = sO[F_QR * P.n + id] + sO[F_QG * P.n + id];
       let w = sO[F_W * P.n + id];
       a[0] += th; a[1] += qv; a[2] += qc; a[3] += qr;
       a[4] = max(a[4], abs(sO[F_U * P.n + id]));

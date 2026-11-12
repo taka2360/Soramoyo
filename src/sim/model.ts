@@ -7,8 +7,8 @@ import statsWgsl from '../shaders/sim/stats.wgsl?raw';
 import { type Grid, type BaseState, type LargeScaleForcing, packColumn, COL_STRIDE } from './grid';
 import { LV, CP } from './thermo';
 
-export const NFIELDS = 7;
-export const F = { U: 0, V: 1, W: 2, TH: 3, QV: 4, QC: 5, QR: 6 } as const;
+export const NFIELDS = 8;
+export const F = { U: 0, V: 1, W: 2, TH: 3, QV: 4, QC: 5, QR: 6, QG: 7 } as const;
 const NSTAT = 16;
 const PARAM_SLOT = 256;
 
@@ -131,12 +131,12 @@ export class CloudModel {
     device.queue.writeBuffer(this.colBuf, 0, packColumn(g, cfg.base, cfg.forcing));
     this.cplx = device.createBuffer({ label: 'cplx', size: n * 8, usage: S });
     const plane = g.nx * g.ny;
-    this.diag = device.createBuffer({ label: 'diag', size: (5 * n + 8 * plane) * 4, usage: S });
+    this.diag = device.createBuffer({ label: 'diag', size: (6 * n + 8 * plane) * 4, usage: S });
     // 地表面温度の初期値 = 最下層の気温
     const ts0 = new Float32Array(plane).fill(cfg.base.th0[0] * cfg.base.pi0[0]);
     device.queue.writeBuffer(this.diag, (n + 2 * plane) * 4, ts0);
     // 正値保存リミッタの係数の初期値（使わないときも 1 にしておく）
-    device.queue.writeBuffer(this.diag, 2 * n * 4, new Float32Array(3 * n).fill(1));
+    device.queue.writeBuffer(this.diag, 2 * n * 4, new Float32Array(4 * n).fill(1));
     this.statsBuf = device.createBuffer({ label: 'stats', size: (g.nz + 1) * NSTAT * 4, usage: S });
     this.statsRead = device.createBuffer({ size: (g.nz + 1) * NSTAT * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     this.paramBuf = device.createBuffer({ size: PARAM_SLOT * 3, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });

@@ -3,8 +3,8 @@
 //  2. 大規模強制：沈降による移流、θ・qv の強制、基本場へのナッジング
 //  3. 地表：エネルギー収支（地温の予報）から顕熱・潜熱、または固定フラックス。地表摩擦
 //  4. 雲の長波放射（雲頂の冷却）
-//  5. 雲微物理（混合相の1モーメント）：飽和調整、自動変換・捕捉・蒸発（雨は Kessler / KW78）
-//  6. 降水の落下（雨と雪）
+//  5. 雲微物理（混合相の1モーメント）：飽和調整、自動変換・捕捉・蒸発（雨は Kessler / KW78）、あられ（着氷・融解）
+//  6. 降水の落下（雨と雪、あられ）
 
 const MAXNZ_M: u32 = 256u;
 const SIGMA_SB: f32 = 5.670e-8;
@@ -25,6 +25,7 @@ fn csMicro(@builtin(global_invocation_id) g: vec3u) {
   var thC: array<f32, MAXNZ_M>;
   var qvC: array<f32, MAXNZ_M>;
   var qrCol: array<f32, MAXNZ_M>;
+  var qgCol: array<f32, MAXNZ_M>;
   var negAcc = 0.0;
 
   // ---- 1. 読み込みと負値の切り詰め
@@ -40,12 +41,15 @@ fn csMicro(@builtin(global_invocation_id) g: vec3u) {
     if (qv < 0.0) { negAcc -= qv * m; qv = 0.0; }
     if (qc < 0.0) { negAcc -= qc * m; qc = 0.0; }
     if (qr < 0.0) { negAcc -= qr * m; qr = 0.0; }
+    var qg = so(F_QG, id);
+    if (qg < 0.0) { negAcc -= qg * m; qg = 0.0; }
     qvC[k] = qv;
     qrCol[k] = qr;
+    qgCol[k] = qg;
     sO[F_QC * P.n + id] = qc;
     let lwc = qc * cl.rho0;
     if (lwc > 1e-9) { tauCloud += 0.02198 * pow(lwc, 2.0 / 3.0) * pow(P.nDrop, 1.0 / 3.0) * cl.dzc; }
-    tauCloud += 3.0 * qr * cl.rho0 * cl.dzc;
+    tauCloud += 3.0 * (qr + qg) * cl.rho0 * cl.dzc;
   }
 
   // ---- 2. 大規模強制（沈降は風上差分。下降流なら上の層の値を運んでくる）
@@ -178,6 +182,7 @@ fn csMicro(@builtin(global_invocation_id) g: vec3u) {
     var qv = qvC[k];
     var qn = so(F_QC, id);
     var qp = qrCol[k];
+    var qg = qgCol[k];
     let p = cl.p0;
     let pi = cl.pi0;
 
@@ -185,8 +190,8 @@ fn csMicro(@builtin(global_invocation_id) g: vec3u) {
       let T0 = th * pi;
       var wn = 1.0; var wp = 1.0;
       if (ice) { wn = liqFracCloud(T0); wp = liqFracPrecip(T0); }
-      // 保存量 θil（このステップの相変化で変わらない）
-      let thil = th - (LV * (wn * qn + wp * qp) + LS * ((1.0 - wn) * qn + (1.0 - wp) * qp)) / (CP * pi);
+      // 保存量 θil（このステップの相変化で変わらない）。あられ qg は常に氷
+      let thil = th - (LV * (wn * qn + wp * qp) + LS * ((1.0 - wn) * qn + (1.0 - wp) * qp + qg)) / (CP * pi);
 
       if (rain) {
         // 自動変換：雲水 → 雨（Kessler）、雲氷 → 雪（併合、温度依存。Lin et al. 1983 の形）
@@ -194,18 +199,49 @@ fn csMicro(@builtin(global_invocation_id) g: vec3u) {
         let qi = (1.0 - wn) * qn;
         let autL = 0.001 * max(ql - 0.001, 0.0);
         let autI = 0.001 * exp(0.025 * (T0 - 273.16)) * max(qi - 1e-4, 0.0);
-        // 捕捉：降水が雲粒を集める（雨は Kessler、雪は効率を下げた同じ形）
-        let effAcc = wp + (1.0 - wp) * 0.5;
-        let rate = autL + autI;
-        let qnOld = qn;
-        qn = (qn - dt * rate) / (1.0 + dt * 2.2 * effAcc * pow(max(qp, 0.0), 0.875));
-        qn = max(qn, 0.0);
-        qp += qnOld - qn;
+        // 捕捉：降水（雨・雪）とあられが雲粒を集める（陰的に解く）。
+        //  降水：Kessler 形 2.2 qp^0.875。雲氷に対する効率は雪で exp(0.025(T−T0))
+        //  あられ：Lin 型（N0 = 4×10⁵ m⁻⁴, 密度 500 kg/m³）を同じ形に直すと 2.2 ρ^0.375 qg^0.875。雲氷への効率 0.1
+        let cP = 2.2 * pow(max(qp, 0.0), 0.875);
+        let cG = 2.2 * pow(cl.rho0, 0.375) * pow(max(qg, 0.0), 0.875);
+        let effI = wp + (1.0 - wp) * exp(0.025 * min(T0 - 273.16, 0.0));  // 雪の雲氷に対する効率（Lin et al. 1983）
+        let aL = min(dt * autL, ql);
+        let aI = min(dt * autI, qi);
+        let qlN = max((ql - aL) / (1.0 + dt * (cP + cG)), 0.0);
+        let qiN = max((qi - aI) / (1.0 + dt * (cP * effI + 0.1 * cG)), 0.0);
+        let colL = max(ql - aL - qlN, 0.0);
+        let colI = max(qi - aI - qiN, 0.0);
+        // 凍った降水（雪）やあられが過冷却の雲水を集める（着氷）と、その分はあられになる
+        let toGL = colL * (cG + (1.0 - wp) * cP) / max(cP + cG, 1e-12);
+        let toGI = colI * (0.1 * cG) / max(cP * effI + 0.1 * cG, 1e-12);
+        qn = qlN + qiN;
+        qg += toGL + toGI;
+        qp += aL + aI + (colL - toGL) + (colI - toGI);
+
+        if (ice) {
+          // 雪 → あられ：過冷却の雲水の中で強く着氷した雪・持ち上げられて凍った雨はあられになる
+          //  （1モーメントでは着氷の度合いを持たないので、雲水量に比例する時定数 300 s で近似）
+          //  + Lin et al. (1983) の雪の併合による変換 1e-3 exp(0.09(T−T0)) (qs − 0.6 g/kg)
+          let qs = (1.0 - wp) * qp;
+          if (qs > 0.0 && T0 < 273.16) {
+            let rRime = min(qlN / 1e-3, 1.0) / 300.0;
+            let rAgg = 1e-3 * exp(0.09 * (T0 - 273.16)) * max(qs - 6e-4, 0.0) / qs;
+            let dq = qs * (1.0 - exp(-dt * (rRime + rAgg)));
+            qp -= dq;
+            qg += dq;
+          }
+          // あられの融解：0℃ より暖かいと溶けて降水（雨）に（時定数 1000 s/K。融解熱は θil の保存で入る）
+          if (qg > 0.0 && T0 > 273.16) {
+            let dm = qg * (1.0 - exp(-dt * 1e-3 * (T0 - 273.16)));
+            qg -= dm;
+            qp += dm;
+          }
+        }
 
         // 降水の蒸発・昇華（未飽和のとき）。雨は Klemp–Wilhelmson、雪は同じ形を半分の効率で
+        let qsl = qvsatLiq(T0, p);
+        let qsi = qvsatIce(T0, p);
         if (qp > 0.0) {
-          let qsl = qvsatLiq(T0, p);
-          let qsi = qvsatIce(T0, p);
           let qsm = wp * qsl + (1.0 - wp) * qsi;
           if (qv < qsm) {
             let rhoqp = 0.001 * cl.rho0 * qp;
@@ -216,6 +252,15 @@ fn csMicro(@builtin(global_invocation_id) g: vec3u) {
             qv += ern;
             qp -= ern;
           }
+        }
+        // あられの昇華（粒が大きく数が少ないので、同じ形を 0.3 倍の効率で）
+        if (qg > 0.0 && qv < qsi) {
+          let rhoqg = 0.001 * cl.rho0 * qg;
+          let cvent = 1.6 + 124.9 * pow(rhoqg, 0.2046);
+          var eg = dt * 0.3 * (cvent * pow(rhoqg, 0.525)) / (2.55e8 / (p * qsi) + 5.4e5) * ((qsi - qv) / (0.001 * cl.rho0 * qsi));
+          eg = min(min(eg, 0.5 * (qsi - qv)), qg);
+          qv += eg;
+          qg -= eg;
         }
       }
 
@@ -231,7 +276,7 @@ fn csMicro(@builtin(global_invocation_id) g: vec3u) {
           if (ice) { a = liqFracCloud(Tj); b = liqFracPrecip(Tj); }
           let qs = a * qvsatLiq(Tj, p) + (1.0 - a) * qvsatIce(Tj, p);
           let qnj = max(qtn - qs, 0.0);
-          let fj = Tj - tl - (LV * (a * qnj + b * qp) + LS * ((1.0 - a) * qnj + (1.0 - b) * qp)) / CP;
+          let fj = Tj - tl - (LV * (a * qnj + b * qp) + LS * ((1.0 - a) * qnj + (1.0 - b) * qp + qg)) / CP;
           if (j == 0) { f0 = fj; } else { f1 = fj; }
         }
         let d = (f1 - f0) / 0.05;
@@ -248,6 +293,7 @@ fn csMicro(@builtin(global_invocation_id) g: vec3u) {
     sO[F_QV * P.n + id] = qv;
     sO[F_QC * P.n + id] = qn;
     qrCol[k] = qp;
+    qgCol[k] = qg;
   }
 
   // ---- 6. 降水の落下（風上差分、CFL に応じて小分け）。雨と雪の割合で落下速度を混ぜる
@@ -255,6 +301,7 @@ fn csMicro(@builtin(global_invocation_id) g: vec3u) {
   if (moist && rain) {
     let rhoS = col[0].rho0;
     var vtC: array<f32, MAXNZ_M>;
+    var vgC: array<f32, MAXNZ_M>;
     var maxC = 0.0;
     for (var k = 0u; k < nz; k++) {
       let cl = col[k];
@@ -269,11 +316,18 @@ fn csMicro(@builtin(global_invocation_id) g: vec3u) {
       }
       vtC[k] = v;
       maxC = max(maxC, v * dt / cl.dzc);
+      // あられ・ひょう：V = 6.8 m/s ×(ρqg / 1 g m⁻³)^(1/8) ×(1 kg m⁻³ / ρ)^(1/2)
+      //  （N0 = 4×10⁵ m⁻⁴, 密度 500 kg/m³, 抗力係数 0.6 の指数分布の質量加重平均。1〜15 m/s に制限）
+      let gq = max(cl.rho0 * qgCol[k], 0.0);
+      let vg = clamp(6.8 * pow(gq * 1000.0, 0.125) / sqrt(cl.rho0), 1.0, 15.0);
+      vgC[k] = vg;
+      if (gq > 0.0) { maxC = max(maxC, vg * dt / cl.dzc); }
     }
     let nsub = u32(clamp(ceil(maxC / 0.8), 1.0, 50.0));
     let dts = dt / f32(nsub);
     for (var s = 0u; s < nsub; s++) {
       var fluxAbove = 0.0;
+      var fluxAboveG = 0.0;
       for (var kk = i32(nz) - 1; kk >= 0; kk--) {
         let k = u32(kk);
         let cl = col[k];
@@ -281,12 +335,17 @@ fn csMicro(@builtin(global_invocation_id) g: vec3u) {
         let fluxOut = cl.rho0 * q * vtC[k];
         qrCol[k] = max(q + dts * (fluxAbove - fluxOut) / (cl.rho0 * cl.dzc), 0.0);
         fluxAbove = fluxOut;
+        let qgk = qgCol[k];
+        let fluxOutG = cl.rho0 * qgk * vgC[k];
+        qgCol[k] = max(qgk + dts * (fluxAboveG - fluxOutG) / (cl.rho0 * cl.dzc), 0.0);
+        fluxAboveG = fluxOutG;
       }
-      precip += fluxAbove * dts;
+      precip += (fluxAbove + fluxAboveG) * dts;
     }
   }
   for (var k = 0u; k < nz; k++) {
     sO[F_QR * P.n + base + pl * k] = qrCol[k];
+    sO[F_QG * P.n + base + pl * k] = qgCol[k];
   }
   diag[dSurf(0u, base)] += precip;
   diag[dSurf(1u, base)] += negAcc;
